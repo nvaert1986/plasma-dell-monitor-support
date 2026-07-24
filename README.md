@@ -131,6 +131,14 @@ Help make the monitor coverage better:
 
 Open an issue with the details and we'll try to add support or troubleshoot.
 
+## Development note
+
+Most of this project was written with **heavy assistance from Claude**
+(Anthropic's AI assistant), with some minor manual modifications. The code has
+been **checked and verified against real hardware where possible** — but, as with
+any software (and especially AI-assisted code that talks to hardware), it may
+still contain bugs. See the risk notice above.
+
 ## License
 
 No license has been chosen yet — add a `LICENSE` file before publishing if you
