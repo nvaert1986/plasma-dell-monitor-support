@@ -8,6 +8,8 @@ per monitor — from your desktop instead of fumbling with the monitor's buttons
 It talks to the monitor the same way Dell's own *Display & Peripheral Manager*
 does on Windows, but natively on Linux.
 
+**Version 1.1** — see the [Changelog](#changelog).
+
 ---
 
 > # ❗ USE AT YOUR OWN RISK
@@ -26,8 +28,19 @@ does on Windows, but natively on Linux.
   supported), **Input Source, OSD Language, Power Mode**.
 - **Set-then-verify** — every change is read back from the monitor to confirm it
   applied.
+- Per-monitor **sub-tabs**: **Information** (read-only identity/status), Settings,
+  Color / Picture, **PIP / PBP**, and **MST**.
+- **PIP / PBP** — Picture-in-Picture / Picture-by-Picture: mode, sub-window input,
+  and size/position toggles, on monitors that support it.
+- **MST (Multi-Stream Transport)** — DisplayPort daisy-chaining enable/disable, on
+  monitors that support it *(experimental — see limitations)*.
+- **Set-then-verify** — every change is read back from the monitor to confirm it
+  applied.
 - Optional per-monitor **range calibration** (some panels clamp/quantise values
   over DDC) and **custom input labels**.
+- **Factory reset** — restore a monitor to its factory defaults over DDC/CI.
+- **Retry detection** — re-scan for monitors without restarting (e.g. after loading
+  `i2c-dev`, enabling DDC/CI, or plugging one in).
 - Lives in the **system tray** with quick per-monitor controls.
 
 Non-Dell monitors are detected but shown as *unsupported* (not touched).
@@ -93,16 +106,24 @@ These have been verified:
 | Model | Connection | Notes |
 |---|---|---|
 | Dell **P2425D** | DisplayPort | Baseline (QHD). |
+| Dell **P2425H** | DisplayPort | Full HD; sharpness works. |
+| Dell **P2222H** | DisplayPort | Full HD entry (VGA/DP/HDMI). |
+| Dell **U2412M** | DisplayPort | UltraSharp 16:10 (1920×1200); older panel. |
 | Dell **P2319H** | DisplayPort | Full HD; has ComfortView. |
 | Dell **P2317H** | HDMI | Full HD; older/simpler panel. |
-| Dell **P3424WE** | USB-C | 34″ ultrawide; PIP/PBP present (not yet exposed). |
-| Dell **P2725HE** | USB-C | Full HD USB-C hub. |
+| Dell **P3424WE** | USB-C | 34″ ultrawide; **PIP / PBP** verified working. |
+| Dell **P2725HE** | USB-C | Full HD USB-C hub; MST-capable. |
 
 See [`TESTED-MONITORS.md`](TESTED-MONITORS.md) for per-model detail.
 
 ## ⚠️ Limitations & known quirks
 
 - **This is early software and may contain bugs.**
+- **MST support is experimental.** Enabling/disabling DisplayPort daisy-chaining
+  only works on certain monitors, and when an MST chain is active, **monitor
+  detection is very slow (~2 minutes)** while `ddcutil` negotiates the link. On
+  many monitors MST can only be toggled from the on-screen menu (the app shows a
+  note in that case).
 - **Some features may not work on some monitors.** Different Dell models (and even
   firmware revisions) expose different DDC/CI features, and some monitors *accept*
   a DDC command but don't actually act on it (a firmware quirk — the setting only
@@ -113,6 +134,26 @@ See [`TESTED-MONITORS.md`](TESTED-MONITORS.md) for per-model detail.
   can set it remotely.
 - Features KDE Plasma handles natively — HDR, VRR/Adaptive-Sync, resolution,
   refresh rate, rotation — are intentionally **out of scope**.
+
+## Changelog
+
+### 1.1
+- **PIP / PBP support** — mode, sub-window input, and size/position toggles
+  (verified on the P3424WE).
+- **MST (Multi-Stream Transport) support** — DisplayPort daisy-chaining
+  enable/disable. **Experimental:** works on some monitors only, and detection is
+  **very slow (~2 minutes)** while an MST chain is active; on many panels MST is
+  OSD-only (the app says so).
+- **Information tab** — read-only per-monitor identity/status (model, serial,
+  firmware, panel technology, connection, etc.).
+- **Retry detection** — re-scan for monitors from the app without restarting.
+- **Factory reset** button — restore a monitor to factory defaults over DDC/CI.
+- **More tested monitors** — added P2425H, P2222H, U2412M (now 8 verified models).
+
+### 1.0
+- Initial release: per-monitor Brightness, Contrast, Sharpness, RGB gain, merged
+  Colour Preset, Input Source, OSD Language, Power; set-then-verify; range
+  calibration; custom input labels; system tray.
 
 ## Contributing / reporting
 
