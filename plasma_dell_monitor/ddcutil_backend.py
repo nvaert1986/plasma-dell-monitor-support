@@ -243,6 +243,33 @@ def set_vcp_word(bus: int, code: int, word: int) -> None:
     _run(["--bus", str(bus), "setvcp", "--noverify", f"{code:02X}", f"0x{word:04X}"])
 
 
+def _full_word(reading: "VcpReading") -> int:
+    """Reconstruct the full 16-bit SH:SL value of a complex reading. ``get_vcp``
+    reports only the low byte (sl) in ``.value``; bitmask registers like a
+    "new-spec" 0xEF keep state in the high byte too (support bits 12-15), so a
+    read-modify-write must operate on the whole word."""
+    rb = reading.raw_bytes
+    if rb and len(rb) >= 2:
+        return (rb[-2] << 8) | rb[-1]  # sh:sl
+    return reading.value
+
+
+def set_vcp_bit(bus: int, code: int, bit: int, on: bool) -> int:
+    """Read-modify-write a single bit of a VCP value, preserving the others.
+    Used for Dell bitmask registers like 0xEF (MST = bit 4). Operates on the full
+    16-bit SH:SL word (matching DDPM's SetMST model, which preserves the high-byte
+    support bits) and writes it back as a word. Returns the full word read back
+    afterwards so the caller can verify the bit took.
+
+    NB: only reached for "new-spec" 0xEF monitors (see features.has_ddc_mst_control);
+    old-spec monitors are OSD-only and never call this. The new-spec path is not
+    hardware-verified (no such monitor available to test)."""
+    cur = _full_word(get_vcp(bus, code))
+    new = (cur | (1 << bit)) if on else (cur & ~(1 << bit))
+    set_vcp_word(bus, code, new)
+    return _full_word(get_vcp(bus, code))
+
+
 _readonly_cache: dict[int, bool] = {}
 
 
@@ -265,3 +292,97 @@ def is_read_only(code: int) -> bool:
     result = bool(attr_lines) and has_ro and not has_write
     _readonly_cache[code] = result
     return result
+
+
+# --- read-only monitor identity / status (for the Information tab) ----------
+_MFG_NAMES = {"DEL": "Dell"}
+_TECH_TYPE = {  # VCP 0xB6 Display technology type (sl byte)
+    0x01: "CRT (shadow mask)", 0x02: "CRT (aperture grille)",
+    0x03: "LCD (active matrix)", 0x04: "LCoS", 0x05: "Plasma",
+    0x06: "OLED", 0x07: "EL", 0x08: "MEM",
+}
+
+
+def get_monitor_info(mon: "Monitor") -> list[tuple[str, str]]:
+    """Return ordered (label, value) rows describing a monitor: EDID identity
+    plus read-only DDC status. All reads, never writes. Missing fields are
+    silently skipped so the Information tab only shows what the panel reports."""
+    info: list[tuple[str, str]] = []
+
+    # --- EDID identity, parsed from a full (non-terse) detect block ----------
+    edid: dict[str, str] = {}
+    try:
+        out = _run(["detect"])
+        for block in re.split(r"\n\s*\n", out):
+            if f"/dev/i2c-{mon.bus}" not in block:
+                continue
+            for key, pat in (
+                ("mfg", r"Mfg id:\s*(.+)"),
+                ("model", r"Model:\s*(.+)"),
+                ("product", r"Product code:\s*(.+)"),
+                ("serial", r"Serial number:\s*(.+)"),
+                ("mfg_date", r"Manufacture year:\s*(.+)"),
+                ("mccs", r"VCP version:\s*(.+)"),
+            ):
+                m = re.search(pat, block)
+                if m:
+                    edid[key] = m.group(1).strip()
+            break
+    except DDCError:
+        pass
+
+    brand = _MFG_NAMES.get(mon.mfg.strip().upper())
+    if not brand and edid.get("mfg") and " - " in edid["mfg"]:
+        brand = edid["mfg"].split(" - ", 1)[1].strip()
+    info.append(("Brand", brand or mon.mfg or "Unknown"))
+
+    # Model code lives in the capability string (e.g. "P2425D").
+    model_code = ""
+    try:
+        cap = _run(["--bus", str(mon.bus), "capabilities", "--terse"])
+        cm = re.search(r"model\(([^)]*)\)", cap)
+        if cm:
+            model_code = cm.group(1).strip()
+    except DDCError:
+        pass
+    info.append(("Model", model_code or mon.model or edid.get("model", "—")))
+    if edid.get("product"):
+        info.append(("Product code", edid["product"]))
+    if mon.serial or edid.get("serial"):
+        info.append(("Serial number", mon.serial or edid.get("serial", "")))
+    if edid.get("mfg_date"):
+        info.append(("Manufactured", edid["mfg_date"]))
+    info.append(("Connection", mon.short_connector))
+    info.append(("I2C bus", f"/dev/i2c-{mon.bus}"))
+    if edid.get("mccs"):
+        info.append(("DDC/CI (MCCS) version", edid["mccs"]))
+
+    # --- read-only DDC status codes ------------------------------------------
+    def _read(code: str) -> str:
+        try:
+            return _run(["--bus", str(mon.bus), "getvcp", code]).strip()
+        except DDCError:
+            return ""
+
+    b6 = _read("B6")  # panel technology
+    mt = re.search(r"sl=0x([0-9a-fA-F]{2})", b6) or re.search(r"x([0-9a-fA-F]{2})\b", b6)
+    if mt:
+        info.append(("Panel technology",
+                     _TECH_TYPE.get(int(mt.group(1), 16), f"type 0x{mt.group(1)}")))
+
+    c8 = _read("C8")  # display controller — keep just the manufacturer
+    mc = re.search(r"Mfg:\s*([A-Za-z0-9 ]+?)(?:\s*\(| )", c8)
+    if mc and mc.group(1).strip().lower() not in ("unknown", ""):
+        info.append(("Controller", mc.group(1).strip()))
+
+    c9 = _read("C9")  # firmware level (ddcutil already decodes e.g. "65.1")
+    fm = re.search(r":\s*([0-9.]+)\s*$", c9.splitlines()[-1]) if c9 else None
+    if fm:
+        info.append(("Firmware level", fm.group(1)))
+
+    c0 = _read("C0")  # display usage / power-on time
+    pm = re.search(r"=\s*(\d+)", c0)
+    if pm:
+        info.append(("Power-on time", f"{int(pm.group(1)):,} hours"))
+
+    return info

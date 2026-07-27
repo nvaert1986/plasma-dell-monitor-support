@@ -213,6 +213,131 @@ def feature_name(code: int) -> str:
     return FEATURE_NAMES.get(code, f"VCP 0x{code:02X}")
 
 
+# --- per-monitor sub-tab grouping -------------------------------------------
+# Each monitor's panel is a QTabWidget of these sub-tabs, in this order.
+# "Information" is a read-only identity/status tab (no controls) and is always
+# leftmost. "MST" is rightmost. Control codes map to Settings / Color·Picture via
+# feature_category; the MST tab (MST enable + USB-C Prioritization) is handled
+# explicitly in the panel.
+TAB_ORDER: list[str] = ["Information", "Settings", "Color / Picture", "PIP / PBP", "MST"]
+
+# "Settings" tab: input / OSD language / power.
+_SETTINGS_CODES: set[int] = {0x60, 0xCC, 0xD6}
+
+
+def feature_category(code: int) -> str:
+    """Which control sub-tab a feature belongs in (one of TAB_ORDER, never
+    'Information'/'PIP / PBP'/'MST'). Everything not in Settings is image-related →
+    Color / Picture (brightness, contrast, sharpness, colour preset, RGB gain).
+    The PIP/PBP and MST codes are routed to their own tabs explicitly in the panel,
+    so they never reach here."""
+    if code in _SETTINGS_CODES:
+        return "Settings"
+    return "Color / Picture"
+
+
+# --- PIP / PBP (Picture-in-Picture / Picture-by-Picture) --------------------
+# From DDPM RE (DDPM.SA.Plugins.User.DeviceManager setter IL). 0xE9 is a
+# mode/command register:
+#   0x00 = Off, 0x21 = PIP small, 0x22 = PIP large, 0x24 (+ other advertised
+#   values 0x28-0x2F / 0x31-0x35 / 0x41.. from DDPM's PbpModes set) = PBP layouts.
+#   0x01 / 0x02 are *command* values (toggle PIP size / cycle PIP position), NOT
+#   selectable modes — surfaced as buttons.
+# 0xE8 = sub-window input source (encoded like the main input 0x60).
+# 0xE5 = read-only status. PIP/PBP only shows a second image with two active inputs.
+# Reverse-engineered from DDPM; verified working on the P3424WE (see DDC_ROADMAP.md).
+PIP_MODE_CODE = 0xE9
+PIP_SUBINPUT_CODE = 0xE8
+PIP_STATUS_CODE = 0xE5
+PIP_TOGGLE_SIZE = 0x01       # setvcp E9 0x01 — toggle PIP small <-> large
+PIP_TOGGLE_POSITION = 0x02   # setvcp E9 0x02 — cycle PIP corner
+_PIP_COMMAND_VALUES: set[int] = {PIP_TOGGLE_SIZE, PIP_TOGGLE_POSITION}
+
+PIP_MODE_LABELS: dict[int, str] = {
+    0x00: "Off",
+    0x21: "PIP — Small",
+    0x22: "PIP — Large",
+    0x24: "PBP — 2 windows",
+}
+
+
+def has_pip(caps: dict[int, list[int] | None]) -> bool:
+    """Whether the monitor advertises the PIP/PBP mode register (0xE9)."""
+    return PIP_MODE_CODE in caps
+
+
+def pip_modes(caps: dict[int, list[int] | None]) -> list[tuple[int, str]]:
+    """Selectable PIP/PBP modes advertised on 0xE9, excluding the command values
+    0x01/0x02 (the size/position toggles). Always includes Off first."""
+    vals = caps.get(PIP_MODE_CODE) or []
+    modes: list[tuple[int, str]] = []
+    for v in vals:
+        if v in _PIP_COMMAND_VALUES:
+            continue
+        label = "Off" if v == 0x00 else PIP_MODE_LABELS.get(v, f"PBP (0x{v:02X})")
+        modes.append((v, label))
+    if not any(v == 0x00 for v, _ in modes):
+        modes.insert(0, (0x00, "Off"))
+    return modes
+
+
+def has_pip_size_toggle(caps: dict[int, list[int] | None]) -> bool:
+    return PIP_TOGGLE_SIZE in (caps.get(PIP_MODE_CODE) or [])
+
+
+def has_pip_position_toggle(caps: dict[int, list[int] | None]) -> bool:
+    return PIP_TOGGLE_POSITION in (caps.get(PIP_MODE_CODE) or [])
+
+
+def input_labels_for(values: list[int]) -> dict[int, str]:
+    """Map input-source values (0x60 encoding, reused for the 0xE8 sub-window
+    input) to friendly labels."""
+    return {v: _VCP60.get(v, f"0x{v:02X}") for v in values}
+
+
+# --- Factory reset (standard MCCS 0x04) -------------------------------------
+# Write-only command: `setvcp 04 01` restores ALL of the monitor's settings to
+# factory defaults. Advertised by essentially every Dell. Offered as a button
+# (not a normal control), gated on the monitor advertising 0x04.
+FACTORY_RESET_CODE = 0x04
+FACTORY_RESET_VALUE = 0x01
+
+
+def has_factory_reset(caps: dict[int, list[int] | None]) -> bool:
+    return FACTORY_RESET_CODE in caps
+
+
+# --- MST (Multi-Stream Transport, DisplayPort daisy-chaining) ---------------
+# 0xEF is a Dell manufacturer register. DDPM (DisplayVCPMethod.GetEFSupport) treats
+# it in one of two ways, chosen by parsing the *advertised* 0xEF capability values
+# as hex and testing bit 15 (>= 0x8000):
+#   * "new spec" (an advertised value >= 0x8000): 0xEF is a bitmask — MST enable is
+#     bit 4 (0x10), iMST bit 5, Hybrid PBP bit 6; support flags in bits 12-15.
+#   * "old spec" (all advertised values < 0x8000, e.g. EF(00 01 0F)): a plain enum.
+# HARDWARE FINDING (P2725HE, old spec, EF(00 01 0F)): writing 0xEF does NOT toggle
+# MST. With MST off vs. on (enabled from the OSD, second monitor daisy-chained and
+# enumerating) 0xEF reads 0x00 in BOTH states — it does not encode MST enable at
+# all. A written 0x01 sticks but has no effect; 0x0F won't even store. So on
+# old-spec monitors MST enable is OSD-only / not DDC-controllable. We therefore only
+# offer the DDC toggle on new-spec monitors (where the bit-4 logic applies); on
+# old-spec ones the MST tab shows an "OSD-only" note instead of a dead control.
+MST_CODE = 0xEF
+MST_ENABLE_BIT = 4  # 0x10
+
+
+def has_mst(caps: dict[int, list[int] | None]) -> bool:
+    """Whether the monitor exposes 0xEF at all (drives the MST tab's presence)."""
+    return 0xEF in caps
+
+
+def has_ddc_mst_control(caps: dict[int, list[int] | None]) -> bool:
+    """Whether MST enable can actually be toggled over DDC — only true for
+    'new-spec' 0xEF monitors (an advertised value with bit 15 set). Old-spec
+    monitors advertise 0xEF but MST enable is OSD-only (verified on the P2725HE)."""
+    vals = caps.get(0xEF)
+    return bool(vals) and any(v >= 0x8000 for v in vals)
+
+
 def feature_kind(code: int, advertised_values: list[int] | None) -> str | None:
     """Return 'continuous', 'enum', or None (not shown)."""
     if code in CONTINUOUS:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import time
 
-from PyQt6.QtCore import Qt, QThreadPool, pyqtSignal
+from PyQt6.QtCore import Qt, QThreadPool, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QActionGroup, QIcon
 from PyQt6.QtWidgets import (
     QApplication,
@@ -39,9 +39,11 @@ from .ddcutil_backend import (
     VcpReading,
     detect_monitors,
     get_capabilities,
+    get_monitor_info,
     get_vcp,
     is_read_only,
     set_vcp,
+    set_vcp_bit,
     set_vcp_word,
 )
 from .workers import Worker
@@ -424,6 +426,100 @@ class UsbcPriorityControl(_BaseControl):
                     f"0x{value:04X}")
 
 
+class PipModeControl(_BaseControl):
+    """PIP/PBP mode selector on the Dell 0xE9 register. Readable (reflects the
+    active mode), so it shows current state; apply writes the mode value and
+    verifies via read-back (base apply_readback). The command values 0x01/0x02
+    (toggle size/position) are separate buttons, not modes, so they never appear
+    in this dropdown. Verified working on the P3424WE.
+    """
+
+    def __init__(self, modes: list, current: int):
+        super().__init__(features.PIP_MODE_CODE)
+        self._modes = modes  # list of (value, label)
+        self.last_good = current
+
+        self.combo = QComboBox()
+        for value, label in modes:
+            self.combo.addItem(label, value)
+        self._set_silent(current)
+        self.combo.activated.connect(self._on_activated)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self.combo, 1)
+        lay.addWidget(self.status)
+
+    def _index_of(self, value: int) -> int:
+        for i in range(self.combo.count()):
+            if self.combo.itemData(i) == value:
+                return i
+        return -1
+
+    def _set_silent(self, value: int):
+        idx = self._index_of(value)
+        if idx < 0:  # monitor reports a mode it didn't advertise — show it anyway
+            self.combo.addItem(f"{self._fmt(value)} (current)", value)
+            idx = self.combo.count() - 1
+        blocked = self.combo.blockSignals(True)
+        self.combo.setCurrentIndex(idx)
+        self.combo.blockSignals(blocked)
+
+    def _on_activated(self, index: int):
+        self.apply_requested.emit(self.code, self.combo.itemData(index))
+
+    def display_value(self) -> str:
+        return self.combo.currentText()
+
+    def _fmt(self, value: int) -> str:
+        return next((label for v, label in self._modes if v == value),
+                    f"0x{value:02X}")
+
+
+class MstControl(_BaseControl):
+    """MST enable/disable — bit 4 of the Dell 0xEF bitmask register.
+
+    Readable (unlike USB-C Prioritization), so it shows the current state. Its
+    apply path is a read-modify-write of bit 4 via MainWindow.apply_mst, behind a
+    confirmation (toggling MST reconfigures the DisplayPort topology).
+    """
+
+    def __init__(self, on: bool):
+        super().__init__(features.MST_CODE)
+        self.last_good = 1 if on else 0
+        self.combo = QComboBox()
+        self.combo.addItem("Disabled", 0)
+        self.combo.addItem("Enabled", 1)
+        self._set_silent(self.last_good)
+        self.combo.activated.connect(self._on_activated)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self.combo, 1)
+        lay.addWidget(self.status)
+
+    def _set_silent(self, value: int):
+        blocked = self.combo.blockSignals(True)
+        self.combo.setCurrentIndex(1 if value else 0)
+        self.combo.blockSignals(blocked)
+
+    def _on_activated(self, index: int):
+        self.apply_requested.emit(self.code, self.combo.itemData(index))
+
+    def load(self, reading: VcpReading):
+        # reading.value is the raw 0xEF byte; MST state is bit 4.
+        on = bool(reading.value & (1 << features.MST_ENABLE_BIT))
+        self.last_good = 1 if on else 0
+        self._set_silent(self.last_good)
+        self.status.set_state("idle")
+
+    def display_value(self) -> str:
+        return self.combo.currentText()
+
+    def _fmt(self, value: int) -> str:
+        return "Enabled" if value else "Disabled"
+
+
 # --- rename-inputs dialog ---------------------------------------------------
 class RenameInputsDialog(QDialog):
     """Edit app-side friendly names for a monitor's input-source values."""
@@ -469,10 +565,12 @@ class RenameInputsDialog(QDialog):
 
 # --- one monitor's panel ----------------------------------------------------
 class MonitorPanel(QWidget):
-    def __init__(self, monitor: Monitor, caps, values, window: "MainWindow"):
+    def __init__(self, monitor: Monitor, caps, values, window: "MainWindow",
+                 info: "list[tuple[str, str]] | None" = None):
         super().__init__()
         self.monitor = monitor
         self.window_ref = window
+        self.info = info or []
         self.controls: dict[int, _BaseControl] = {}
         self.calibration = calibration.load(monitor.serial, monitor.model)
         self.input_names = input_names.load(monitor.serial, monitor.model)
@@ -494,9 +592,35 @@ class MonitorPanel(QWidget):
         line.setFrameShadow(QFrame.Shadow.Sunken)
         outer.addWidget(line)
 
-        form = QFormLayout()
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        # One QFormLayout per sub-tab (Information / Settings / Color·Picture),
+        # each in its own scroll page. Information is leftmost and read-only.
+        self.forms: dict[str, QFormLayout] = {}
+        self.subtabs = QTabWidget()
+        for category in features.TAB_ORDER:
+            form = QFormLayout()
+            form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+            form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+            self.forms[category] = form
+            page = QWidget()
+            page_lay = QVBoxLayout(page)
+            page_lay.addLayout(form)
+            page_lay.addStretch(1)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setWidget(page)
+            self.subtabs.addTab(scroll, category)
+
+        # Information tab — read-only monitor identity + status (no controls).
+        info_form = self.forms.get("Information")
+        if info_form is not None:
+            for label, value in self.info:
+                val = QLabel(str(value))
+                val.setTextFormat(Qt.TextFormat.PlainText)
+                val.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                val.setWordWrap(True)
+                info_form.addRow(f"{label}:", val)
+            if info_form.rowCount() == 0:
+                info_form.addRow(QLabel("<i>No monitor information available.</i>"))
 
         codes = features.ordered_editable(caps)
         preset_items = features.build_preset_items(caps) if features.has_merged_preset(caps) else []
@@ -529,22 +653,126 @@ class MonitorPanel(QWidget):
                 lambda code, value, c=ctl: window.apply_setting(self, c, code, value)
             )
             self.controls[code] = ctl
-            form.addRow(features.feature_name(code) + ":", ctl)
+            self.forms[features.feature_category(code)].addRow(
+                features.feature_name(code) + ":", ctl
+            )
 
-        # USB-C Prioritization / MST bandwidth (two-level 0xEA) — own apply path
+        # PIP / PBP tab: mode selector + sub-window input + size/position toggles.
+        # From DDPM RE (0xE9 mode/command, 0xE8 sub-input, 0xE5 status); verified
+        # working on the P3424WE. Gated on 0xE9 advertised.
+        pip_form = self.forms["PIP / PBP"]
+        if features.has_pip(caps):
+            e9_reading = values.get(features.PIP_MODE_CODE)
+            current_mode = e9_reading.value if e9_reading else 0x00
+            pip = PipModeControl(features.pip_modes(caps), current_mode)
+            pip.apply_requested.connect(
+                lambda code, value, c=pip: window.apply_pip_mode(self, c, value)
+            )
+            self.controls[features.PIP_MODE_CODE] = pip
+            pip_form.addRow("Mode:", pip)
+
+            # sub-window input source (0xE8), encoded like the main input 0x60
+            sub_vals = caps.get(features.PIP_SUBINPUT_CODE)
+            if sub_vals:
+                sub_reading = values.get(features.PIP_SUBINPUT_CODE)
+                sub_current = sub_reading.value if sub_reading else sub_vals[0]
+                sub = EnumControl(features.PIP_SUBINPUT_CODE, sub_vals, sub_current,
+                                  features.input_labels_for(sub_vals))
+                sub.apply_requested.connect(
+                    lambda code, value, c=sub: window.apply_setting(self, c, code, value)
+                )
+                self.controls[features.PIP_SUBINPUT_CODE] = sub
+                pip_form.addRow("Sub-window input:", sub)
+
+            # size / position toggles (0xE9 command values 0x01 / 0x02)
+            btn_row = QHBoxLayout()
+            if features.has_pip_size_toggle(caps):
+                bs = QPushButton("Toggle PIP size")
+                bs.clicked.connect(
+                    lambda _=False: window.apply_pip_command(
+                        self, features.PIP_TOGGLE_SIZE, "size")
+                )
+                btn_row.addWidget(bs)
+            if features.has_pip_position_toggle(caps):
+                bp = QPushButton("Toggle PIP position")
+                bp.clicked.connect(
+                    lambda _=False: window.apply_pip_command(
+                        self, features.PIP_TOGGLE_POSITION, "position")
+                )
+                btn_row.addWidget(bp)
+            if btn_row.count():
+                wrap = QWidget()
+                wrap.setLayout(btn_row)
+                pip_form.addRow("PIP window:", wrap)
+
+            # read-only status (0xE5), if the monitor returned one
+            st = values.get(features.PIP_STATUS_CODE)
+            if st is not None:
+                pip_form.addRow("Status (0xE5):", QLabel(f"0x{st.value:02X}"))
+
+            note = QLabel(
+                "<i>PIP/PBP needs two active inputs to show a second image. "
+                "Switching mode briefly blanks the screen while the panel "
+                "re-initialises — this is normal.</i>"
+            )
+            note.setWordWrap(True)
+            pip_form.addRow(note)
+        else:
+            note = QLabel("<i>PIP / PBP is not available on this monitor.</i>")
+            note.setWordWrap(True)
+            pip_form.addRow(note)
+
+        # MST tab (rightmost): MST enable/disable, with USB-C Prioritization below.
+        # The DDC toggle is only offered on "new-spec" 0xEF monitors, where the bit-4
+        # write actually controls MST. On "old-spec" monitors (which still advertise
+        # 0xEF, e.g. the P2725HE) MST enable is OSD-only — writing 0xEF has no effect
+        # (hardware-verified) — so we show an informational note instead of a dead
+        # control. Monitors without 0xEF at all show a "not available" note.
+        mst_form = self.forms["MST"]
+        if features.has_ddc_mst_control(caps):
+            ef_reading = values.get(features.MST_CODE)
+            mst_on = bool(ef_reading.value & (1 << features.MST_ENABLE_BIT)) if ef_reading else False
+            mst = MstControl(mst_on)
+            mst.apply_requested.connect(
+                lambda code, enable, c=mst: window.apply_mst(self, c, bool(enable))
+            )
+            self.controls[features.MST_CODE] = mst
+            mst_form.addRow("MST (Multi-Stream Transport):", mst)
+        elif features.has_mst(caps):
+            note = QLabel(
+                "<i>MST (Multi-Stream Transport) on this monitor is enabled/disabled "
+                "from the monitor's on-screen display (OSD) menu — it is not "
+                "controllable over DDC/CI. Once MST is on, the USB-C bandwidth mode "
+                "below takes effect.</i>"
+            )
+            note.setWordWrap(True)
+            mst_form.addRow(note)
+        else:
+            note = QLabel(
+                "<i>MST (Multi-Stream Transport) is not available on this monitor.</i>"
+            )
+            note.setWordWrap(True)
+            mst_form.addRow(note)
+
+        # USB-C Prioritization / MST bandwidth (two-level 0xEA) — own apply path,
+        # lives on the MST tab, directly below the MST toggle.
         if features.has_usbc_priority(caps):
             usbc = UsbcPriorityControl(features.USBC_PRIORITY_OPTIONS)
             usbc.apply_requested.connect(
                 lambda code, word, c=usbc: window.apply_usbc_priority(self, c, word)
             )
             self.controls[features.USBC_PRIORITY_CODE] = usbc
-            form.addRow(features.feature_name(features.USBC_PRIORITY_CODE) + ":", usbc)
+            mst_form.addRow(
+                features.feature_name(features.USBC_PRIORITY_CODE) + ":", usbc
+            )
 
-        if not self.controls:
-            form.addRow(QLabel("<i>No adjustable DDC/CI features reported.</i>"))
+        # Placeholder for any control tab that ended up empty (Information, PIP/PBP
+        # and MST are all populated explicitly above, so skip them here).
+        for category, cat_form in self.forms.items():
+            if category not in ("Information", "PIP / PBP", "MST") and cat_form.rowCount() == 0:
+                cat_form.addRow(QLabel("<i>No adjustable features on this tab.</i>"))
 
-        outer.addLayout(form)
-        outer.addStretch(1)
+        outer.addWidget(self.subtabs, 1)
 
         buttons = QHBoxLayout()
         refresh = QPushButton("Re-read from monitor")
@@ -570,6 +798,15 @@ class MonitorPanel(QWidget):
             )
             rename_btn.clicked.connect(lambda: window.rename_inputs(self))
             buttons.addWidget(rename_btn)
+
+        if features.has_factory_reset(caps):
+            reset_btn = QPushButton("Factory reset…")
+            reset_btn.setToolTip(
+                "Restore ALL of this monitor's settings to factory defaults "
+                "(brightness, contrast, colour, input, etc.). Cannot be undone."
+            )
+            reset_btn.clicked.connect(lambda: window.factory_reset(self))
+            buttons.addWidget(reset_btn)
 
         buttons.addStretch(1)
         outer.addLayout(buttons)
@@ -606,11 +843,15 @@ class MainWindow(QMainWindow):
         lv.addStretch(1)
         self._loading_label = QLabel("Detecting monitors via ddcutil…")
         self._loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        bar = QProgressBar()
-        bar.setRange(0, 0)
-        bar.setFixedWidth(240)
+        self._loading_bar = QProgressBar()
+        self._loading_bar.setRange(0, 0)  # indeterminate (busy) spinner
+        self._loading_bar.setFixedWidth(240)
+        self._retry_btn = QPushButton("Retry detection")
+        self._retry_btn.setVisible(False)
+        self._retry_btn.clicked.connect(self._retry_detection)
         lv.addWidget(self._loading_label)
-        lv.addWidget(bar, alignment=Qt.AlignmentFlag.AlignCenter)
+        lv.addWidget(self._loading_bar, alignment=Qt.AlignmentFlag.AlignCenter)
+        lv.addWidget(self._retry_btn, alignment=Qt.AlignmentFlag.AlignCenter)
         lv.addStretch(1)
         self.setCentralWidget(self._loading)
 
@@ -781,13 +1022,25 @@ class MainWindow(QMainWindow):
         worker.signals.error.connect(self._on_detect_error)
         self.pool.start(worker)
 
+    def _retry_detection(self):
+        """Re-run detection after a failure or an empty result (e.g. once i2c-dev
+        is loaded, DDC/CI is enabled in the OSD, or a Dell is plugged in), without
+        restarting the app. Restores the loading screen in case a blocked/message
+        screen replaced it."""
+        self.setCentralWidget(self._loading)
+        self._retry_btn.setVisible(False)
+        self._loading_bar.setVisible(True)
+        self._loading_label.setText("Detecting monitors via ddcutil…")
+        self.statusBar().showMessage("Re-detecting…")
+        self.start_detection()
+
     @staticmethod
     def _collect_snapshot():
         snapshots = []
         for mon in detect_monitors():
             if not mon.is_dell:
                 # Not a Dell panel — don't probe it; it gets an "unsupported" tab.
-                snapshots.append((mon, None, {}))
+                snapshots.append((mon, None, {}, None))
                 continue
             caps = get_capabilities(mon.bus)
             values: dict[int, VcpReading] = {}
@@ -804,7 +1057,24 @@ class MainWindow(QMainWindow):
                     values[features.PRESET_CODE] = get_vcp(mon.bus, 0xE2)
                 except DDCError:
                     pass
-            snapshots.append((mon, caps, values))
+            # read the 0xEF bitmask register to seed the MST toggle — only on
+            # new-spec monitors, where the toggle is actually shown (old-spec 0xEF
+            # monitors get an OSD-only note, so the read would be wasted)
+            if features.has_ddc_mst_control(caps):
+                try:
+                    values[features.MST_CODE] = get_vcp(mon.bus, features.MST_CODE)
+                except DDCError:
+                    pass
+            # read the PIP/PBP registers (mode 0xE9, sub-input 0xE8, status 0xE5)
+            if features.has_pip(caps):
+                for pip_code in (features.PIP_MODE_CODE, features.PIP_SUBINPUT_CODE,
+                                 features.PIP_STATUS_CODE):
+                    try:
+                        values[pip_code] = get_vcp(mon.bus, pip_code)
+                    except DDCError:
+                        pass
+            info = get_monitor_info(mon)  # read-only identity/status for the Info tab
+            snapshots.append((mon, caps, values, info))
         return snapshots
 
     def _on_detected(self, snapshots):
@@ -815,6 +1085,8 @@ class MainWindow(QMainWindow):
                 "are shown.\nCheck that you have permission to use ddcutil "
                 "(i2c-dev / group access)."
             )
+            self._loading_bar.setVisible(False)
+            self._retry_btn.setVisible(True)
             self.statusBar().showMessage("No monitors detected.")
             return
 
@@ -837,14 +1109,14 @@ class MainWindow(QMainWindow):
         # At least one Dell: build normal tabs for Dell, an unsupported tab each
         # for the rest. Only Dell panels go into self.panels (tray / controls).
         tabs = QTabWidget()
-        for mon, caps, values in dell:
-            panel = MonitorPanel(mon, caps, values, self)
+        for mon, caps, values, info in dell:
+            panel = MonitorPanel(mon, caps, values, self, info)
             self.panels.append(panel)
             scroll = QScrollArea()
             scroll.setWidgetResizable(True)
             scroll.setWidget(panel)
             tabs.addTab(scroll, mon.tab_label)
-        for mon, _caps, _values in non_dell:
+        for mon, _caps, _values, _info in non_dell:
             tab = _message_screen(
                 f"{mon.model or mon.vendor} — not supported",
                 f"<b>{mon.vendor}</b> monitor on {mon.short_connector} "
@@ -863,7 +1135,10 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(msg, 6000)
 
     def _on_detect_error(self, msg: str):
+        self.setCentralWidget(self._loading)  # in case a blocked screen replaced it
         self._loading_label.setText(f"Detection failed:\n\n{msg}")
+        self._loading_bar.setVisible(False)
+        self._retry_btn.setVisible(True)
         self.statusBar().showMessage("Detection failed.")
 
     # -- applying a setting --------------------------------------------------
@@ -993,6 +1268,173 @@ class MainWindow(QMainWindow):
             f"{panel.monitor.model}: USB-C Prioritization → {label} (sent)", 5000
         )
 
+    # -- MST enable/disable (read-modify-write of 0xEF bit 4) ----------------
+    def apply_mst(self, panel: MonitorPanel, control, enable: bool):
+        verb = "Enable" if enable else "Disable"
+        reply = QMessageBox.question(
+            self,
+            "MST (Multi-Stream Transport)",
+            f"{verb} MST on <b>{panel.monitor.model}</b>?<br><br>"
+            "This reconfigures the DisplayPort topology — the screen may blank "
+            "and monitors may re-enumerate. You may need to re-read (or restart "
+            "the app) afterwards.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            control.revert()
+            return
+        control.set_busy()
+        self.statusBar().showMessage(f"{panel.monitor.model}: {verb.lower()}ing MST…")
+        worker = Worker(set_vcp_bit, panel.monitor.bus,
+                        features.MST_CODE, features.MST_ENABLE_BIT, enable)
+        worker.signals.finished.connect(
+            lambda newval: self._on_mst_applied(panel, control, enable, newval)
+        )
+        worker.signals.error.connect(
+            lambda msg: self._on_apply_error(panel, control, features.MST_CODE, msg)
+        )
+        self.pool.start(worker)
+
+    def _on_mst_applied(self, panel, control, enable, newval):
+        actual_on = bool(newval & (1 << features.MST_ENABLE_BIT))
+        control.last_good = 1 if actual_on else 0
+        control._set_silent(control.last_good)
+        if actual_on == enable:
+            control.ok_result = True
+            control.status.set_state(
+                "ok", f"MST {'enabled' if actual_on else 'disabled'}"
+            )
+        else:
+            control.ok_result = False
+            control.status.set_state("warn", "MST change did not take")
+        self.statusBar().showMessage(
+            f"{panel.monitor.model}: MST → {'Enabled' if actual_on else 'Disabled'}",
+            6000,
+        )
+
+    # -- PIP / PBP (0xE9 mode + 0x01/0x02 command toggles) -------------------
+    def apply_pip_mode(self, panel: MonitorPanel, control, value: int):
+        # Changing PIP/PBP mode re-lays out the panel — confirm it.
+        label = control._fmt(value)
+        reply = QMessageBox.question(
+            self,
+            "PIP / PBP",
+            f"Set PIP/PBP mode to <b>{label}</b> on {panel.monitor.model}?<br><br>"
+            "This changes the on-screen layout. PIP/PBP only shows a second image "
+            "when a second input is actively connected.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            control.revert()
+            return
+        control.set_busy()
+        self.statusBar().showMessage(
+            f"{panel.monitor.model}: setting PIP/PBP mode… (the screen may blank)"
+        )
+        worker = Worker(self._set_and_verify_pip, panel.monitor.bus,
+                        features.PIP_MODE_CODE, value)
+        worker.signals.finished.connect(
+            lambda result: self._on_pip_mode_applied(panel, control, value, result)
+        )
+        # Even a hard error is usually just the panel mid-re-init — don't scream
+        # "failed"; treat it as applied-but-unconfirmed.
+        worker.signals.error.connect(
+            lambda msg: self._on_pip_mode_applied(panel, control, value, (None, False))
+        )
+        self.pool.start(worker)
+
+    @staticmethod
+    def _set_and_verify_pip(bus: int, code: int, value: int):
+        """Apply a PIP/PBP mode and confirm it, tolerating the panel blanking and
+        re-initialising when PIP/PBP is entered or left (which makes the immediate
+        read-back error out or return a transient value). Polls the read-back with
+        growing delays, ignoring read errors while the monitor is away. Returns
+        ``(reading_or_None, confirmed)``."""
+        set_vcp(bus, code, value)
+        last = None
+        for delay in (1.0, 1.5, 2.0, 2.5, 3.0):
+            time.sleep(delay)
+            try:
+                last = get_vcp(bus, code)
+            except DDCError:
+                last = None  # monitor still coming back — keep waiting
+                continue
+            if last.value == value:
+                return last, True
+        return last, False
+
+    def _on_pip_mode_applied(self, panel, control, requested, result):
+        reading, confirmed = result
+        if confirmed:
+            control.apply_readback(reading, requested)  # marks OK "confirmed"
+            self.statusBar().showMessage(
+                f"{panel.monitor.model}: PIP/PBP = {control.display_value()} ✓", 4000
+            )
+        elif reading is not None:
+            # got a clean read but it disagrees — a genuine mismatch
+            control.apply_readback(reading, requested)  # marks warn
+            self.statusBar().showMessage(
+                f"{panel.monitor.model}: PIP/PBP did not take — monitor reports "
+                f"{control.display_value()}", 8000
+            )
+        else:
+            # never got a clean read (monitor kept re-initialising). The change
+            # almost certainly took — reflect the request, but say it's unconfirmed.
+            control.last_good = requested
+            control._set_silent(requested)
+            control.ok_result = True
+            control.status.set_state(
+                "ok", "applied (monitor re-initialised — could not confirm)"
+            )
+            self.statusBar().showMessage(
+                f"{panel.monitor.model}: PIP/PBP = {control.display_value()} "
+                "(applied; not confirmed — panel re-initialised)", 6000
+            )
+
+    def apply_pip_command(self, panel: MonitorPanel, cmd_value: int, what: str):
+        # 0xE9 command (0x01 toggle size / 0x02 cycle position). Fire-and-forget:
+        # 0xE9 reads back the current *mode*, not the command, so we just send it
+        # and re-read the mode (tolerantly) to refresh the dropdown.
+        self.statusBar().showMessage(f"{panel.monitor.model}: PIP {what} toggle…")
+        worker = Worker(self._send_and_read_pip, panel.monitor.bus,
+                        features.PIP_MODE_CODE, cmd_value)
+        worker.signals.finished.connect(
+            lambda result: self._on_pip_command_done(panel, what, result)
+        )
+        worker.signals.error.connect(
+            lambda msg: self._on_pip_command_done(panel, what, (None, False))
+        )
+        self.pool.start(worker)
+
+    @staticmethod
+    def _send_and_read_pip(bus: int, code: int, cmd: int):
+        """Send a 0xE9 *command* (toggle size/position) and read the resulting
+        mode back. 0xE9 reflects the mode, not the command, so we don't verify
+        equality — just return the first mode read that succeeds (tolerating the
+        brief blank). Returns ``(reading_or_None, ok)``."""
+        set_vcp(bus, code, cmd)
+        for delay in (1.0, 1.5, 2.0):
+            time.sleep(delay)
+            try:
+                return get_vcp(bus, code), True
+            except DDCError:
+                continue
+        return None, False
+
+    def _on_pip_command_done(self, panel, what, result):
+        reading, _confirmed = result
+        ctl = panel.controls.get(features.PIP_MODE_CODE)
+        if ctl is not None and reading is not None:
+            ctl.load(reading)  # reflect whatever mode 0xE9 now reports
+        mode = ctl.display_value() if ctl else "?"
+        self.statusBar().showMessage(
+            f"{panel.monitor.model}: PIP {what} toggled"
+            + (f" (mode now {mode})" if reading is not None else " (mode not re-read)"),
+            4000,
+        )
+
     # -- manual refresh ------------------------------------------------------
     def refresh_panel(self, panel: MonitorPanel):
         panel.set_enabled_controls(False)
@@ -1024,6 +1466,41 @@ class MainWindow(QMainWindow):
         panel.set_enabled_controls(True)
         self._rebuild_tray_menu()
         self.statusBar().showMessage(f"{panel.monitor.model}: re-read complete.", 4000)
+
+    # -- factory reset (standard MCCS 0x04) ----------------------------------
+    def factory_reset(self, panel: MonitorPanel):
+        reply = QMessageBox.question(
+            self,
+            "Factory Reset",
+            f"Restore <b>{panel.monitor.model or 'this monitor'}</b> to "
+            "<b>factory defaults</b>?<br><br>"
+            "⚠ This resets <b>all</b> of the monitor's settings (brightness, "
+            "contrast, colour, input, etc.) via DDC/CI. It <b>cannot be undone</b>.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        bus = panel.monitor.bus
+        panel.set_enabled_controls(False)
+        self.statusBar().showMessage(
+            f"{panel.monitor.model}: restoring factory defaults…"
+        )
+        worker = Worker(set_vcp, bus, features.FACTORY_RESET_CODE,
+                        features.FACTORY_RESET_VALUE)
+        # The monitor re-initialises after a reset; re-read shortly afterwards so
+        # every control reflects the restored defaults.
+        worker.signals.finished.connect(
+            lambda _r: QTimer.singleShot(4000, lambda: self.refresh_panel(panel))
+        )
+        worker.signals.error.connect(
+            lambda msg: (
+                panel.set_enabled_controls(True),
+                self.statusBar().showMessage(
+                    f"{panel.monitor.model}: factory reset failed — {msg}", 8000),
+            )
+        )
+        self.pool.start(worker)
 
     # -- calibration ---------------------------------------------------------
     def calibrate_panel(self, panel: MonitorPanel):
