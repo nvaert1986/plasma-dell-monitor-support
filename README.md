@@ -8,7 +8,7 @@ per monitor — from your desktop instead of fumbling with the monitor's buttons
 It talks to the monitor the same way Dell's own *Display & Peripheral Manager*
 does on Windows, but natively on Linux.
 
-**Version 1.1** — see the [Changelog](#changelog).
+**Version 1.2** — see the [Changelog](#changelog).
 
 ---
 
@@ -34,16 +34,99 @@ does on Windows, but natively on Linux.
   and size/position toggles, on monitors that support it.
 - **MST (Multi-Stream Transport)** — DisplayPort daisy-chaining enable/disable, on
   monitors that support it *(experimental — see limitations)*.
-- **Set-then-verify** — every change is read back from the monitor to confirm it
-  applied.
 - Optional per-monitor **range calibration** (some panels clamp/quantise values
   over DDC) and **custom input labels**.
 - **Factory reset** — restore a monitor to its factory defaults over DDC/CI.
+- **Copy settings to other monitors** — mirror one monitor's image settings
+  (brightness, contrast, sharpness, RGB gain, colour preset) to your other Dell
+  monitors, clamped to each one's range and skipping anything it doesn't support.
+- **Export / import settings** — save a monitor's image settings (and OSD
+  language) to a JSON file, and import them back onto the same or a different Dell
+  monitor (all settings, or just the image ones), skipping anything unsupported.
+- **Command-line control for hotkeys** — a small `cli.py` lets you bind keys (KDE
+  Custom Shortcuts) to adjust brightness/contrast/sharpness/RGB gain or cycle
+  colour presets. It talks to the running app over D-Bus, so it's instant.
+- **Profiles (10 per monitor)** — save a monitor's visual settings (brightness,
+  contrast, sharpness, RGB gain, colour preset) into a numbered, labelled slot
+  (e.g. "6. Gaming", "7. Movies") and load it instantly — from the Settings tab or
+  a hotkey. Perfect for switching from web-browsing to a movie.
 - **Retry detection** — re-scan for monitors without restarting (e.g. after loading
   `i2c-dev`, enabling DDC/CI, or plugging one in).
 - Lives in the **system tray** with quick per-monitor controls.
 
 Non-Dell monitors are detected but shown as *unsupported* (not touched).
+
+## Command-line control & hotkeys
+
+`cli.py` lets you drive the app from the command line — its main purpose is to be
+bound to **keyboard shortcuts** so you can nudge brightness, cycle a colour preset,
+or jump to a saved profile without opening a window.
+
+### How it works
+
+`cli.py` does **not** talk to the monitor itself. Instead it sends a request to the
+**already-running GUI app** over **D-Bus**, and the GUI performs the change. That
+design is deliberate and has three benefits:
+
+- **Instant** — the GUI already has your monitors detected, so there's no slow
+  per-press `ddcutil detect` (which can take a couple of minutes on an MST chain).
+- **Live UI** — because the GUI makes the change, its sliders and dropdowns update
+  immediately, and its normal *set-then-verify* read-back still runs.
+- **No conflicts** — the GUI stays the single owner of DDC/CI access, so the CLI and
+  GUI never fight over the I²C bus.
+
+The trade-off: **the GUI app must be running** (keep it in the tray). If it isn't,
+`cli.py` prints a message and exits with a non-zero status — it never falls back to
+poking the hardware directly.
+
+> `cli.py` only needs **PyQt6** (for its D-Bus client) and a **session bus** — both
+> already present on a normal KDE session. It doesn't import the rest of the app.
+
+### Command grammar
+
+```
+python3 cli.py <feature> <action> [value] [--monitor SEL | --all] [--step N] [--notify]
+python3 cli.py list
+```
+
+| Feature | Actions | Notes |
+|---|---|---|
+| `brightness`, `contrast`, `sharpness` | `up`, `down`, `set <0-100>` | `up`/`down` use the monitor's own step; override with `--step`. |
+| `gain-red`, `gain-green`, `gain-blue` | `up`, `down`, `set <0-100>` | RGB colour gain. |
+| `preset` | `next`, `prev`, `set <name>` | Cycles / picks the merged Colour Preset ("Standard", "Movie"…). |
+| `profile` | `load <0-9>`, `next`, `prev` | Applies a saved profile slot; `next`/`prev` cycle your filled slots. |
+| `list` | — | Prints the detected monitors (model, serial, bus). |
+
+- **Target** — every command (except `list`) needs a monitor: `--monitor` accepts a
+  **serial**, **model**, or **I²C bus number**; or use `--all` for every monitor.
+- **`--step N`** — step size for `up`/`down` (defaults to the monitor's calibrated
+  step).
+- **`--notify`** — pop a desktop notification with the result (e.g. "brightness = 60").
+- **Exit codes** — `0` success · `2` no monitor selected · `3` the app isn't running
+  · `1` the request was rejected (e.g. feature not supported on that monitor).
+
+### Examples
+
+```bash
+python3 cli.py list                                  # what's connected
+python3 cli.py brightness up    --monitor 3DMZZB4    # +1 step, by serial
+python3 cli.py brightness down  --monitor P2425D --step 5   # -5, by model
+python3 cli.py contrast set 50  --all                # exact value, all monitors
+python3 cli.py preset next      --all --notify       # cycle colour presets + notify
+python3 cli.py profile load 6   --monitor 3DMZZB4    # jump to profile "6. Gaming"
+python3 cli.py profile next     --monitor 3DMZZB4    # cycle saved profiles
+```
+
+### Binding to a key in KDE Plasma
+
+1. **System Settings ▸ Shortcuts ▸ Custom Shortcuts**.
+2. **Edit ▸ New ▸ Global Shortcut ▸ Command/URL**.
+3. Set the **Trigger** (the key combo) and the **Action** to the full command, e.g.
+   `python3 /path/to/plasma-dell-monitor-support/cli.py brightness up --all`
+   (use the **absolute path** to `cli.py`).
+
+Tip: pair `brightness up` / `brightness down` on two keys for a hardware-style
+brightness control, or map `profile load 6` / `profile load 7` to switch scenes.
 
 ## Requirements
 
@@ -136,6 +219,28 @@ See [`TESTED-MONITORS.md`](TESTED-MONITORS.md) for per-model detail.
   refresh rate, rotation — are intentionally **out of scope**.
 
 ## Changelog
+
+### 1.2
+- **Profiles — 10 saved slots per monitor.** Save a monitor's visual settings
+  (brightness, contrast, sharpness, RGB gain, colour preset) into a numbered,
+  labelled slot ("6. Gaming", "7. Movies") on the Settings tab, and load it from the
+  UI or a hotkey. Visual settings only.
+- **Command-line control (`cli.py`) for hotkeys.** Adjust brightness/contrast/
+  sharpness/RGB gain, cycle colour presets, and load/cycle profiles from the command
+  line — via D-Bus to the running app, so it's instant. Bind keys in KDE Custom
+  Shortcuts (see the "Command-line control & hotkeys" section).
+- **Copy settings to other monitors.** A per-monitor "Copy to other monitors…"
+  button that mirrors image settings to your other Dell monitors, with a live
+  preview of what will be applied and what's skipped (clamped to each monitor's
+  range; unsupported settings and unavailable presets are skipped).
+- **Export / import settings.** "Export settings from monitor…" / "Import settings
+  to monitor…" on the Settings tab. Export writes a JSON file
+  (`Dell-<model>-<serial>.json`); import lets you choose *all settings* (image + OSD
+  language) or *image settings only*, and warns (skippably) about anything the target
+  monitor doesn't support.
+- **Information tab niceties.** A **Copy** button next to the serial number, and an
+  **"Export information…"** button that saves everything shown on the Information tab
+  to a `.txt` file (`Dell-<model>-<serial>.txt`).
 
 ### 1.1
 - **PIP / PBP support** — mode, sub-window input, and size/position toggles
