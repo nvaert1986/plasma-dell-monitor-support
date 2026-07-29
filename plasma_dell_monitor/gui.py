@@ -2,24 +2,32 @@
 
 from __future__ import annotations
 
+import json
 import os
 import time
+from datetime import datetime
 
-from PyQt6.QtCore import Qt, QThreadPool, QTimer, pyqtSignal
+from PyQt6.QtCore import QObject, QSize, Qt, QThreadPool, QTimer, pyqtSignal, pyqtSlot
+from PyQt6.QtDBus import QDBusConnection
 from PyQt6.QtGui import QAction, QActionGroup, QIcon
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QFrame,
+    QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QScrollArea,
@@ -27,11 +35,12 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QSystemTrayIcon,
     QTabWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from . import __version__, calibration, features, input_names
+from . import __version__, app_settings, calibration, features, input_names, profiles
 from .calibration import Range
 from .ddcutil_backend import (
     DDCError,
@@ -521,6 +530,331 @@ class MstControl(_BaseControl):
 
 
 # --- rename-inputs dialog ---------------------------------------------------
+# --- bulk "copy settings to other monitors" ---------------------------------
+# Image settings that mean the same thing on every monitor, so they can be copied
+# across panels. Deliberately EXCLUDES per-monitor-inherent settings (input source,
+# power, MST, PIP, USB-C priority). The merged Colour Preset is handled separately
+# (matched by label, since raw values differ per model).
+_BULK_CONTINUOUS: tuple[int, ...] = (0x10, 0x12, 0x87, 0x16, 0x18, 0x1A)
+
+
+def bulk_eligible_codes(panel: "MonitorPanel") -> list[int]:
+    """Codes on this panel that can be offered for bulk copy (continuous image
+    settings it actually has, plus the merged Colour Preset)."""
+    codes = [c for c in _BULK_CONTINUOUS
+             if isinstance(panel.controls.get(c), ContinuousControl)]
+    if isinstance(panel.controls.get(features.PRESET_CODE), PresetControl):
+        codes.append(features.PRESET_CODE)
+    return codes
+
+
+def plan_bulk_copy(source_panel: "MonitorPanel", target_panel: "MonitorPanel",
+                   selected_codes: "set[int]"):
+    """Determine what copying source→target would do, restricted to selected_codes.
+
+    Returns ``(writes, skips)`` where:
+      * writes = list of ``(code, value, description)`` — direct setvcp writes,
+        with continuous values clamped/snapped to the TARGET's calibrated range and
+        the Colour Preset resolved to the target's own write code/value.
+      * skips  = list of ``(feature_name, reason)`` — eligible on the source but not
+        applicable to this target.
+    """
+    writes: list = []
+    skips: list = []
+    for code in _BULK_CONTINUOUS:
+        if code not in selected_codes:
+            continue
+        src = source_panel.controls.get(code)
+        if not isinstance(src, ContinuousControl):
+            continue  # source doesn't have it → not part of the copy set
+        tgt = target_panel.controls.get(code)
+        if not isinstance(tgt, ContinuousControl):
+            skips.append((features.feature_name(code), "not supported"))
+            continue
+        value = tgt._snap(src.spin.value())  # clamp/snap to the target's range
+        writes.append((code, value, f"{features.feature_name(code)} = {value}"))
+
+    if features.PRESET_CODE in selected_codes:
+        src_p = source_panel.controls.get(features.PRESET_CODE)
+        if isinstance(src_p, PresetControl):
+            tgt_p = target_panel.controls.get(features.PRESET_CODE)
+            if not isinstance(tgt_p, PresetControl):
+                skips.append(("Colour Preset", "not supported"))
+            else:
+                label = src_p.display_value()
+                item = next((it for it in tgt_p._items if it.label == label), None)
+                if item is not None:
+                    writes.append((item.write_code, item.write_value,
+                                   f"Colour Preset = {label}"))
+                else:
+                    skips.append(("Colour Preset", f"'{label}' not available"))
+    return writes, skips
+
+
+class CopyToMonitorsDialog(QDialog):
+    """Pick which settings to copy from one monitor to the others, with a live
+    preview of exactly what will be applied and what will be skipped per target."""
+
+    def __init__(self, source_panel, target_panels, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Copy settings to other monitors")
+        self.source_panel = source_panel
+        self.target_panels = target_panels
+
+        outer = QVBoxLayout(self)
+        src_name = source_panel.monitor.model or source_panel.monitor.vendor
+        outer.addWidget(QLabel(
+            f"Copy image settings from <b>{src_name}</b> to your other Dell monitors."
+        ))
+
+        row = QHBoxLayout()
+        settings_box = QGroupBox("Settings to copy")
+        sv = QVBoxLayout(settings_box)
+        self.setting_checks: dict[int, QCheckBox] = {}
+        for code in bulk_eligible_codes(source_panel):
+            cb = QCheckBox(features.feature_name(code))
+            cb.setChecked(True)
+            cb.stateChanged.connect(self._update_preview)
+            sv.addWidget(cb)
+            self.setting_checks[code] = cb
+        sv.addStretch(1)
+        row.addWidget(settings_box)
+
+        targets_box = QGroupBox("Apply to")
+        tv = QVBoxLayout(targets_box)
+        self.target_checks: dict = {}
+        for p in target_panels:
+            cb = QCheckBox(p.monitor.model or p.monitor.vendor)
+            cb.setChecked(True)
+            cb.stateChanged.connect(self._update_preview)
+            tv.addWidget(cb)
+            self.target_checks[p] = cb
+        tv.addStretch(1)
+        row.addWidget(targets_box)
+        outer.addLayout(row)
+
+        outer.addWidget(QLabel("Preview:"))
+        self.preview = QPlainTextEdit()
+        self.preview.setReadOnly(True)
+        self.preview.setMinimumHeight(150)
+        outer.addWidget(self.preview)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Apply | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.apply_btn = btns.button(QDialogButtonBox.StandardButton.Apply)
+        self.apply_btn.clicked.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        outer.addWidget(btns)
+
+        self._update_preview()
+
+    def selected_codes(self) -> "set[int]":
+        return {c for c, cb in self.setting_checks.items() if cb.isChecked()}
+
+    def selected_targets(self) -> list:
+        return [p for p, cb in self.target_checks.items() if cb.isChecked()]
+
+    def plan(self) -> dict:
+        """{target_panel: (writes, skips)} for the current selection."""
+        codes = self.selected_codes()
+        return {p: plan_bulk_copy(self.source_panel, p, codes)
+                for p in self.selected_targets()}
+
+    def _update_preview(self):
+        codes = self.selected_codes()
+        targets = self.selected_targets()
+        lines: list[str] = []
+        any_write = False
+        if not codes:
+            lines.append("No settings selected.")
+        elif not targets:
+            lines.append("No target monitors selected.")
+        else:
+            for p in targets:
+                writes, skips = plan_bulk_copy(self.source_panel, p, codes)
+                label = p.monitor.model or p.monitor.vendor
+                if writes:
+                    any_write = True
+                    lines.append(f"{label}  →  " + ", ".join(d for _, _, d in writes))
+                else:
+                    lines.append(f"{label}  →  (nothing to apply)")
+                for feat, reason in skips:
+                    lines.append(f"      skip: {feat} ({reason})")
+        self.preview.setPlainText("\n".join(lines))
+        self.apply_btn.setEnabled(any_write)
+
+
+# --- export / import a monitor's settings to/from a JSON file ---------------
+# Exportable set = the image settings (same as bulk-copy) + OSD Language. The
+# "All settings" import applies all of those the target supports; "Image settings
+# only" applies just the image ones. Input, Power, MST/PIP/USB-C are excluded.
+SETTINGS_FILE_FORMAT = "plasma-dell-monitor-support/settings"
+SETTINGS_FILE_VERSION = 1
+_OSD_LANGUAGE_CODE = 0xCC
+_EXPORT_CODES: tuple[int, ...] = _BULK_CONTINUOUS + (_OSD_LANGUAGE_CODE,)
+
+
+def export_settings_dict(panel: "MonitorPanel", codes: "tuple[int, ...]" = _EXPORT_CODES) -> dict:
+    """Snapshot a panel's settings as a JSON-serialisable dict keyed by ``0xNN`` /
+    ``preset``. Defaults to the full export set (image + OSD Language); pass
+    ``_BULK_CONTINUOUS`` for image-only (used by Profiles). The Colour Preset is
+    always included when present."""
+    settings: dict = {}
+    for code in codes:
+        ctl = panel.controls.get(code)
+        if isinstance(ctl, ContinuousControl):
+            settings[f"0x{code:02X}"] = {
+                "name": features.feature_name(code), "value": ctl.spin.value()}
+        elif isinstance(ctl, EnumControl):
+            settings[f"0x{code:02X}"] = {
+                "name": features.feature_name(code), "value": ctl.combo.currentData()}
+    pc = panel.controls.get(features.PRESET_CODE)
+    if isinstance(pc, PresetControl):
+        settings["preset"] = {"name": "Colour Preset", "label": pc.display_value()}
+    return settings
+
+
+def plan_import(settings: dict, target_panel: "MonitorPanel", scope: str):
+    """Plan applying imported ``settings`` to ``target_panel``.
+
+    ``scope`` is 'all' (image settings + OSD Language) or 'image' (image only).
+    Returns ``(writes, skips)`` — writes are ``(code, value, description)``; skips
+    are ``(feature_name, reason)``. Settings excluded by ``scope`` (e.g. OSD
+    Language when scope='image') are dropped silently, NOT reported as skips —
+    only genuinely-unsupported settings become skip warnings."""
+    allowed = set(_BULK_CONTINUOUS)
+    if scope == "all":
+        allowed.add(_OSD_LANGUAGE_CODE)
+    writes: list = []
+    skips: list = []
+    for key, entry in settings.items():
+        if key == "preset":
+            label = (entry or {}).get("label")
+            tgt_p = target_panel.controls.get(features.PRESET_CODE)
+            if not isinstance(tgt_p, PresetControl):
+                skips.append(("Colour Preset", "is not supported on this monitor"))
+            else:
+                item = next((it for it in tgt_p._items if it.label == label), None)
+                if item is None:
+                    skips.append(("Colour Preset",
+                                  f"preset '{label}' is not available on this monitor"))
+                else:
+                    writes.append((item.write_code, item.write_value,
+                                   f"Colour Preset = {label}"))
+            continue
+        try:
+            code = int(key, 16)
+        except (ValueError, TypeError):
+            continue
+        if code not in allowed:
+            continue  # intentionally out of scope (e.g. OSD Language in image mode)
+        value = (entry or {}).get("value")
+        if value is None:
+            continue
+        name = features.feature_name(code)
+        ctl = target_panel.controls.get(code)
+        if isinstance(ctl, ContinuousControl):
+            snapped = ctl._snap(int(value))
+            writes.append((code, snapped, f"{name} = {snapped}"))
+        elif isinstance(ctl, EnumControl):
+            advertised = [ctl.combo.itemData(i) for i in range(ctl.combo.count())]
+            if int(value) in advertised:
+                writes.append((code, int(value), name))
+            else:
+                skips.append((name, "value is not available on this monitor"))
+        else:
+            skips.append((name, "is not supported on this monitor"))
+    return writes, skips
+
+
+class ProfilesBar(QWidget):
+    """Per-monitor Profiles: a slot dropdown (0-9, showing "N. Label") plus Save
+    and Load buttons. Profiles hold only the visual/image settings. Lives on the
+    Settings tab; also driveable via the CLI (`profile load N` / `next` / `prev`)."""
+
+    def __init__(self, panel, window):
+        super().__init__()
+        self.panel = panel
+        self.window = window
+        self.combo = QComboBox()
+        self.save_btn = QPushButton("Save")
+        self.save_btn.setToolTip("Save this monitor's current image settings into "
+                                 "the selected profile slot (you can label it).")
+        self.load_btn = QPushButton("Load")
+        self.load_btn.setToolTip("Apply the selected profile to this monitor.")
+        self.save_btn.clicked.connect(self._on_save)
+        self.load_btn.clicked.connect(self._on_load)
+        self.combo.currentIndexChanged.connect(self._update_load_enabled)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self.combo, 1)
+        lay.addWidget(self.save_btn)
+        lay.addWidget(self.load_btn)
+        self.reload()
+
+    def reload(self):
+        """Repopulate the dropdown from stored profiles (keeps the selection)."""
+        mon = self.panel.monitor
+        profs = profiles.load(mon.serial, mon.model)
+        keep = self.combo.currentData()
+        blocked = self.combo.blockSignals(True)
+        self.combo.clear()
+        for slot in range(profiles.NUM_SLOTS):
+            entry = profs.get(slot)
+            label = (entry or {}).get("label", "")
+            text = f"{slot}. {label}" if label else f"{slot}. (empty)"
+            self.combo.addItem(text, slot)
+        if keep is not None:
+            self.combo.setCurrentIndex(int(keep))
+        self.combo.blockSignals(blocked)
+        self._update_load_enabled()
+
+    def _update_load_enabled(self):
+        mon = self.panel.monitor
+        slot = self.combo.currentData()
+        entry = profiles.get_slot(mon.serial, mon.model, slot) if slot is not None else None
+        self.load_btn.setEnabled(bool(entry and entry.get("settings")))
+
+    def _on_save(self):
+        self.window.save_profile(self.panel, self.combo.currentData(), self)
+
+    def _on_load(self):
+        self.window.load_profile(self.panel, self.combo.currentData())
+
+
+# --- D-Bus control surface (for the CLI / hotkeys) --------------------------
+# The running GUI registers this service; `cli.py` is a thin client. Because the
+# GUI already has the monitors detected and owns all DDC access, hotkey commands
+# apply instantly (no per-press detection) and the GUI's UI updates live.
+DBUS_SERVICE = "io.github.plasma_dell_monitor"
+DBUS_PATH = "/Control"
+
+# CLI feature name -> continuous VCP code.
+CLI_CONTINUOUS: dict[str, int] = {
+    "brightness": 0x10, "contrast": 0x12, "sharpness": 0x87,
+    "gain-red": 0x16, "gain-green": 0x18, "gain-blue": 0x1A,
+}
+
+
+class _DBusControl(QObject):
+    """D-Bus object exposing the CLI surface. Slots are exported via ExportAllSlots;
+    they run on the GUI thread, so touching widgets from here is safe."""
+
+    def __init__(self, window: "MainWindow"):
+        super().__init__()
+        self._window = window
+
+    @pyqtSlot(result=str)
+    def ListMonitors(self) -> str:
+        return self._window.dbus_list_monitors()
+
+    @pyqtSlot(str, str, str, str, result=str)
+    def Adjust(self, target: str, feature: str, action: str, value: str) -> str:
+        return self._window.perform_adjust(target, feature, action, value)
+
+
 class RenameInputsDialog(QDialog):
     """Edit app-side friendly names for a monitor's input-source values."""
 
@@ -618,9 +952,51 @@ class MonitorPanel(QWidget):
                 val.setTextFormat(Qt.TextFormat.PlainText)
                 val.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
                 val.setWordWrap(True)
-                info_form.addRow(f"{label}:", val)
+                if label == "Serial number":
+                    # value, then a small Copy button immediately after it (a
+                    # trailing stretch keeps both left-aligned so the button doesn't
+                    # drift right / grow with the window).
+                    val.setWordWrap(False)
+                    row = QWidget()
+                    rl = QHBoxLayout(row)
+                    rl.setContentsMargins(0, 0, 0, 0)
+                    rl.setSpacing(6)
+                    rl.addWidget(val)
+                    copy_btn = QToolButton()
+                    copy_btn.setAutoRaise(True)  # compact, keeps the row height normal
+                    icon = QIcon.fromTheme("edit-copy")
+                    if icon.isNull():
+                        copy_btn.setText("Copy")
+                    else:
+                        copy_btn.setIcon(icon)
+                    copy_btn.setToolTip("Copy the serial number to the clipboard")
+                    copy_btn.clicked.connect(
+                        lambda _=False, s=str(value): window.copy_serial(s))
+                    # match the plain-label row height so the serial row lines up
+                    # evenly with the rows above/below (no taller gap)
+                    _h = val.sizeHint().height()
+                    copy_btn.setFixedHeight(_h)
+                    copy_btn.setIconSize(QSize(_h - 3, _h - 3))
+                    rl.addWidget(copy_btn)
+                    rl.addStretch(1)
+                    info_form.addRow(f"{label}:", row)
+                else:
+                    info_form.addRow(f"{label}:", val)
             if info_form.rowCount() == 0:
                 info_form.addRow(QLabel("<i>No monitor information available.</i>"))
+            elif self.info:
+                # a plain, natural-sized button (a trailing stretch stops the form
+                # from stretching it full-width)
+                export_info_btn = QPushButton("Export information…")
+                export_info_btn.setToolTip(
+                    "Save all the information shown on this tab to a text file.")
+                export_info_btn.clicked.connect(lambda: window.export_information(self))
+                wrap = QWidget()
+                wl = QHBoxLayout(wrap)
+                wl.setContentsMargins(0, 0, 0, 0)
+                wl.addWidget(export_info_btn)
+                wl.addStretch(1)
+                info_form.addRow(wrap)
 
         codes = features.ordered_editable(caps)
         preset_items = features.build_preset_items(caps) if features.has_merged_preset(caps) else []
@@ -656,6 +1032,30 @@ class MonitorPanel(QWidget):
             self.forms[features.feature_category(code)].addRow(
                 features.feature_name(code) + ":", ctl
             )
+
+        # Export / Import settings — on the Settings tab (whole-monitor file ops).
+        io_row = QHBoxLayout()
+        export_btn = QPushButton("Export settings from monitor…")
+        export_btn.setToolTip(
+            "Save this monitor's image settings and OSD Language to a JSON file."
+        )
+        export_btn.clicked.connect(lambda: window.export_settings(self))
+        import_btn = QPushButton("Import settings to monitor…")
+        import_btn.setToolTip(
+            "Load a settings JSON file and apply it to this monitor (you choose all "
+            "settings or just the image settings)."
+        )
+        import_btn.clicked.connect(lambda: window.import_settings(self))
+        io_row.addWidget(export_btn)
+        io_row.addWidget(import_btn)
+        io_row.addStretch(1)
+        io_wrap = QWidget()
+        io_wrap.setLayout(io_row)
+        self.forms["Settings"].addRow(io_wrap)
+
+        # Profiles (per-monitor, 10 slots) — visual/image settings only.
+        self.profiles_bar = ProfilesBar(self, window)
+        self.forms["Settings"].addRow("Profile:", self.profiles_bar)
 
         # PIP / PBP tab: mode selector + sub-window input + size/position toggles.
         # From DDPM RE (0xE9 mode/command, 0xE8 sub-input, 0xE5 status); verified
@@ -808,6 +1208,15 @@ class MonitorPanel(QWidget):
             reset_btn.clicked.connect(lambda: window.factory_reset(self))
             buttons.addWidget(reset_btn)
 
+        copy_btn = QPushButton("Copy to other monitors…")
+        copy_btn.setToolTip(
+            "Copy this monitor's image settings (brightness, contrast, sharpness, "
+            "RGB gain, colour preset) to your other Dell monitors — clamped to each "
+            "monitor's range and skipping any they don't support."
+        )
+        copy_btn.clicked.connect(lambda: window.copy_to_monitors(self))
+        buttons.addWidget(copy_btn)
+
         buttons.addStretch(1)
         outer.addLayout(buttons)
 
@@ -829,7 +1238,10 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Plasma Dell Monitor Support")
         self.setWindowIcon(app_icon())
-        self.resize(680, 560)
+        # Start comfortably wide enough that the tab contents don't trigger a
+        # horizontal scrollbar; a minimum keeps it usable if the user shrinks it.
+        self.resize(820, 700)
+        self.setMinimumSize(620, 500)
         self.pool = QThreadPool.globalInstance()
         self.panels: list[MonitorPanel] = []
         self._really_quit = False
@@ -856,6 +1268,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self._loading)
 
         self.statusBar().showMessage("Starting…")
+        self._register_dbus()  # expose the CLI/hotkey control surface
         self.start_detection()
 
     # -- menu bar ------------------------------------------------------------
@@ -1501,6 +1914,404 @@ class MainWindow(QMainWindow):
             )
         )
         self.pool.start(worker)
+
+    # -- copy settings to other monitors -------------------------------------
+    def copy_to_monitors(self, source_panel: MonitorPanel):
+        targets = [p for p in self.panels if p is not source_panel]
+        if not targets:
+            QMessageBox.information(
+                self, "Copy settings",
+                "Only one Dell monitor is connected — there's nothing to copy to.")
+            return
+        dlg = CopyToMonitorsDialog(source_panel, targets, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        plans = dlg.plan()
+        # jobs: only targets that actually have something to write
+        jobs = [(p.monitor.bus, [(c, v) for c, v, _ in writes])
+                for p, (writes, _skips) in plans.items() if writes]
+        if not jobs:
+            return
+        for p in plans:
+            p.set_enabled_controls(False)
+        self.statusBar().showMessage(f"Copying settings to {len(jobs)} monitor(s)…")
+        worker = Worker(self._apply_bulk_all, jobs)
+        worker.signals.finished.connect(lambda res: self._on_bulk_applied(plans, res))
+        worker.signals.error.connect(
+            lambda msg: self._on_bulk_error(plans, msg))
+        self.pool.start(worker)
+
+    @staticmethod
+    def _apply_bulk_all(jobs):
+        """jobs: list of (bus, [(code, value), ...]). Writes each in turn (best-effort,
+        set-then-read). Returns list of (bus, applied, failed)."""
+        out = []
+        for bus, writes in jobs:
+            applied = failed = 0
+            for code, value in writes:
+                try:
+                    set_vcp(bus, code, value)
+                    time.sleep(_SETTLE_SECONDS)
+                    get_vcp(bus, code)  # settle read (best-effort verify)
+                    applied += 1
+                except DDCError:
+                    failed += 1
+            out.append((bus, applied, failed))
+        return out
+
+    def _on_bulk_applied(self, plans, results, verb="Copied"):
+        # re-read every target so its controls reflect the new values
+        for p in plans:
+            self.refresh_panel(p)
+        applied = sum(a for _, a, _ in results)
+        failed = sum(f for _, _, f in results)
+        skipped = sum(len(skips) for _, (_w, skips) in plans.items())
+        target_word = "monitor" if len(results) == 1 else "monitors"
+        msg = f"{verb} {applied} setting(s) to {len(results)} {target_word}."
+        if skipped:
+            msg += f" Skipped {skipped}."
+        if failed:
+            msg += f" {failed} failed."
+        self.statusBar().showMessage(msg, 8000)
+
+    def _on_bulk_error(self, plans, msg):
+        for p in plans:
+            p.set_enabled_controls(True)
+        self.statusBar().showMessage(f"Failed — {msg}", 8000)
+
+    # -- Information tab: copy serial / export info --------------------------
+    def copy_serial(self, serial: str):
+        QApplication.clipboard().setText(serial)
+        self.statusBar().showMessage(f"Serial copied: {serial}", 4000)
+
+    def export_information(self, panel: MonitorPanel):
+        if not panel.info:
+            return
+        mon = panel.monitor
+        model = mon.model or "Monitor"
+        for token in ("DELL", "Dell", "dell"):
+            model = model.replace(token, "")
+        model = model.strip() or "Monitor"
+        default = f"Dell-{model}-{mon.serial or 'unknown'}.txt"
+        default = "".join(c if (c.isalnum() or c in "._-") else "_" for c in default)
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export information", default, "Text files (*.txt)")
+        if not path:
+            return
+        if not path.lower().endswith(".txt"):
+            path += ".txt"
+        lines = ["Plasma Dell Monitor Support — monitor information",
+                 f"Exported: {datetime.now().isoformat(timespec='seconds')}", ""]
+        lines += [f"{label}: {value}" for label, value in panel.info]
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(lines) + "\n")
+        except OSError as e:
+            QMessageBox.warning(self, "Export failed", f"Couldn't write the file:\n{e}")
+            return
+        self.statusBar().showMessage(
+            f"Exported information to {os.path.basename(path)}", 6000)
+
+    # -- export / import settings (JSON) -------------------------------------
+    def export_settings(self, panel: MonitorPanel):
+        settings = export_settings_dict(panel)
+        if not settings:
+            QMessageBox.information(
+                self, "Export settings",
+                "This monitor has no exportable settings.")
+            return
+        mon = panel.monitor
+        model = mon.model or "Monitor"
+        for token in ("DELL", "Dell", "dell"):
+            model = model.replace(token, "")
+        model = model.strip() or "Monitor"
+        default = f"Dell-{model}-{mon.serial or 'unknown'}.json"
+        default = "".join(c if (c.isalnum() or c in "._-") else "_" for c in default)
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export settings from monitor", default, "Settings JSON (*.json)")
+        if not path:
+            return
+        if not path.lower().endswith(".json"):
+            path += ".json"
+        payload = {
+            "format": SETTINGS_FILE_FORMAT,
+            "version": SETTINGS_FILE_VERSION,
+            "app_version": __version__,
+            "exported_at": datetime.now().isoformat(timespec="seconds"),
+            "monitor": {"brand": "Dell", "model": mon.model, "serial": mon.serial,
+                        "connector": mon.connector},
+            "settings": settings,
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2)
+        except OSError as e:
+            QMessageBox.warning(self, "Export failed", f"Couldn't write the file:\n{e}")
+            return
+        self.statusBar().showMessage(
+            f"Exported {len(settings)} setting(s) to {os.path.basename(path)}", 6000)
+
+    def import_settings(self, panel: MonitorPanel):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import settings to monitor", "",
+            "Settings JSON (*.json);;All files (*)")
+        if not path:
+            return
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            settings = data["settings"]
+            if not isinstance(settings, dict):
+                raise ValueError("file has no settings object")
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            QMessageBox.warning(
+                self, "Import failed", f"Couldn't read a valid settings file:\n{e}")
+            return
+
+        # Ask scope (All settings vs image only) — don't apply automatically.
+        box = QMessageBox(self)
+        box.setWindowTitle("Import settings")
+        src = (data.get("monitor") or {}).get("model") or "the file"
+        box.setText(
+            f"Import settings from <b>{src}</b> to <b>{panel.monitor.model}</b>.<br><br>"
+            "Which settings do you want to import?")
+        all_btn = box.addButton("All settings", QMessageBox.ButtonRole.AcceptRole)
+        img_btn = box.addButton("Image settings only", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is all_btn:
+            scope = "all"
+        elif clicked is img_btn:
+            scope = "image"
+        else:
+            return
+
+        writes, skips = plan_import(settings, panel, scope)
+        if skips and not self._warn_skips(skips):
+            return  # user cancelled at a warning
+        if not writes:
+            QMessageBox.information(
+                self, "Import settings",
+                "None of the settings in this file apply to this monitor.")
+            return
+        panel.set_enabled_controls(False)
+        self.statusBar().showMessage(f"Importing settings to {panel.monitor.model}…")
+        jobs = [(panel.monitor.bus, [(c, v) for c, v, _ in writes])]
+        worker = Worker(self._apply_bulk_all, jobs)
+        worker.signals.finished.connect(
+            lambda res: self._on_bulk_applied({panel: (writes, skips)}, res,
+                                              verb="Imported"))
+        worker.signals.error.connect(
+            lambda msg: self._on_bulk_error({panel: (writes, skips)}, msg))
+        self.pool.start(worker)
+
+    def _warn_skips(self, skips) -> bool:
+        """Show a warning per skipped setting (sequential), honouring the persistent
+        'suppress' preference and an in-dialog 'don't show again' checkbox. Returns
+        True to proceed with the import, False to cancel it."""
+        if app_settings.get("suppress_import_warnings", False):
+            return True
+        for feat, reason in skips:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle("Setting will be skipped")
+            box.setText(
+                f"<b>Warning:</b> {feat} {reason}.<br><br>This setting will be skipped.")
+            cb = QCheckBox("Don't show these warnings again")
+            box.setCheckBox(cb)
+            box.setStandardButtons(
+                QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
+            box.button(QMessageBox.StandardButton.Ok).setText("Continue")
+            box.button(QMessageBox.StandardButton.Cancel).setText("Cancel import")
+            result = box.exec()
+            if cb.isChecked():
+                app_settings.set("suppress_import_warnings", True)  # persist
+            if result == QMessageBox.StandardButton.Cancel:
+                return False
+            if cb.isChecked():
+                break  # stop showing warnings, but proceed with the import
+        return True
+
+    # -- profiles (per-monitor, 10 slots of visual settings) -----------------
+    def _run_apply(self, panel, writes, skips, verb):
+        """Apply planned writes to one panel via a worker (set-then-verify),
+        refresh it, and report. Shared by profile load."""
+        if not writes:
+            return "nothing to apply"
+        panel.set_enabled_controls(False)
+        jobs = [(panel.monitor.bus, [(c, v) for c, v, _ in writes])]
+        worker = Worker(self._apply_bulk_all, jobs)
+        worker.signals.finished.connect(
+            lambda res: self._on_bulk_applied({panel: (writes, skips)}, res, verb=verb))
+        worker.signals.error.connect(
+            lambda msg: self._on_bulk_error({panel: (writes, skips)}, msg))
+        self.pool.start(worker)
+        return f"{len(writes)} setting(s)"
+
+    def save_profile(self, panel: MonitorPanel, slot, bar=None):
+        if slot is None:
+            return
+        mon = panel.monitor
+        existing = profiles.get_slot(mon.serial, mon.model, slot) or {}
+        label, ok = QInputDialog.getText(
+            self, "Save profile",
+            f"Label for profile {slot} (shown as \"{slot}. <label>\"):",
+            text=existing.get("label", ""))
+        if not ok:
+            return
+        settings = export_settings_dict(panel, _BULK_CONTINUOUS)  # image only
+        profiles.save_slot(mon.serial, mon.model, slot, label.strip(), settings)
+        if bar is not None:
+            bar.reload()
+        self.statusBar().showMessage(
+            f"{mon.model}: saved profile {slot}"
+            + (f" ({label.strip()})" if label.strip() else ""), 5000)
+
+    def _apply_profile(self, panel: MonitorPanel, slot) -> str:
+        mon = panel.monitor
+        entry = profiles.get_slot(mon.serial, mon.model, slot)
+        if not entry or not entry.get("settings"):
+            return f"profile {slot} is empty"
+        writes, skips = plan_import(entry["settings"], panel, "image")
+        panel._current_profile_slot = int(slot)
+        self._run_apply(panel, writes, skips, verb="Loaded profile")
+        label = entry.get("label") or ""
+        return f"profile {slot}" + (f" ({label})" if label else "") + " loaded"
+
+    def load_profile(self, panel: MonitorPanel, slot):
+        if slot is None:
+            return
+        result = self._apply_profile(panel, slot)
+        if "empty" in result:
+            QMessageBox.information(self, "Load profile",
+                                    f"Profile {slot} has nothing saved yet.")
+            return
+        self.statusBar().showMessage(f"{panel.monitor.model}: {result}", 5000)
+
+    def _cycle_profile(self, panel: MonitorPanel, direction: str) -> str:
+        mon = panel.monitor
+        profs = profiles.load(mon.serial, mon.model)
+        filled = sorted(s for s, e in profs.items() if e.get("settings"))
+        if not filled:
+            return "no saved profiles"
+        cur = getattr(panel, "_current_profile_slot", -1)
+        if cur in filled:
+            i = filled.index(cur)
+            nxt = filled[(i + (1 if direction == "next" else -1)) % len(filled)]
+        else:
+            nxt = filled[0] if direction == "next" else filled[-1]
+        return self._apply_profile(panel, nxt)
+
+    # -- D-Bus / CLI control surface -----------------------------------------
+    def _register_dbus(self):
+        """Register the D-Bus service so the CLI can drive us. Non-fatal if there's
+        no session bus (headless) or the name is already taken."""
+        try:
+            conn = QDBusConnection.sessionBus()
+            if not conn.isConnected():
+                return
+            self._dbus_obj = _DBusControl(self)
+            if conn.registerService(DBUS_SERVICE):
+                conn.registerObject(
+                    DBUS_PATH, self._dbus_obj,
+                    QDBusConnection.RegisterOption.ExportAllSlots)
+        except Exception:
+            pass  # D-Bus unavailable — the GUI still works, just no CLI bridge
+
+    def dbus_list_monitors(self) -> str:
+        """JSON list of the controllable Dell monitors (for `cli.py list`)."""
+        mons = [{"model": p.monitor.model, "serial": p.monitor.serial,
+                 "bus": p.monitor.bus, "connector": p.monitor.connector}
+                for p in self.panels]
+        return json.dumps(mons)
+
+    def _resolve_targets(self, target: str) -> "list[MonitorPanel]":
+        t = (target or "").strip().lower()
+        if t in ("", "all"):
+            return list(self.panels)
+        out = []
+        for p in self.panels:
+            mon = p.monitor
+            if (t == str(mon.serial).lower()
+                    or t == str(mon.bus)
+                    or t in (mon.model or "").lower()):
+                out.append(p)
+        return out
+
+    def perform_adjust(self, target: str, feature: str, action: str, value: str) -> str:
+        """Apply a CLI adjustment. Runs on the GUI thread; reuses the normal
+        apply path (set-then-verify + live UI). Returns a human-readable result."""
+        panels = self._resolve_targets(target)
+        if not panels:
+            return f"error: no monitor matches '{target}'"
+        return "\n".join(self._adjust_one(p, feature, action, value) for p in panels)
+
+    def _adjust_one(self, panel: "MonitorPanel", feature: str, action: str,
+                    value: str) -> str:
+        model = panel.monitor.model or panel.monitor.serial or "monitor"
+        feature = (feature or "").lower()
+        action = (action or "").lower()
+
+        if feature in CLI_CONTINUOUS:
+            code = CLI_CONTINUOUS[feature]
+            ctl = panel.controls.get(code)
+            if not isinstance(ctl, ContinuousControl):
+                return f"{model}: {feature} not supported"
+            cur = ctl.spin.value()
+            if action == "set":
+                try:
+                    new = int(value)
+                except (ValueError, TypeError):
+                    return f"{model}: '{value}' is not a number"
+            elif action in ("up", "down"):
+                try:
+                    step = int(value) if str(value).strip() else ctl.step
+                except (ValueError, TypeError):
+                    step = ctl.step
+                step = step if step > 0 else 1
+                new = cur + step if action == "up" else cur - step
+            else:
+                return f"{model}: unknown action '{action}' for {feature}"
+            new = ctl._snap(new)
+            self.apply_setting(panel, ctl, code, new)
+            return f"{model}: {feature} = {new}"
+
+        if feature == "preset":
+            ctl = panel.controls.get(features.PRESET_CODE)
+            if not isinstance(ctl, PresetControl):
+                return f"{model}: preset not supported"
+            n = ctl.combo.count()
+            if n == 0:
+                return f"{model}: no presets"
+            if action in ("next", "prev"):
+                idx = (ctl.combo.currentIndex()
+                       + (1 if action == "next" else -1)) % n
+            elif action == "set":
+                idx = next((i for i in range(n)
+                            if ctl.combo.itemText(i).lower() == str(value).lower()), -1)
+                if idx < 0:
+                    return f"{model}: preset '{value}' not available"
+            else:
+                return f"{model}: unknown action '{action}' for preset"
+            ctl.combo.setCurrentIndex(idx)
+            ctl._on_activated(idx)  # emits apply_requested -> apply_setting
+            return f"{model}: preset = {ctl.combo.itemText(idx)}"
+
+        if feature == "profile":
+            if action == "load":
+                try:
+                    slot = int(value)
+                except (ValueError, TypeError):
+                    return f"{model}: '{value}' is not a slot number (0-9)"
+                if not (0 <= slot < profiles.NUM_SLOTS):
+                    return f"{model}: profile slot must be 0-{profiles.NUM_SLOTS - 1}"
+                return f"{model}: {self._apply_profile(panel, slot)}"
+            if action in ("next", "prev"):
+                return f"{model}: {self._cycle_profile(panel, action)}"
+            return f"{model}: unknown action '{action}' for profile"
+
+        return f"{model}: unknown feature '{feature}'"
 
     # -- calibration ---------------------------------------------------------
     def calibrate_panel(self, panel: MonitorPanel):
