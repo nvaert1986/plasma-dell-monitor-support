@@ -29,6 +29,7 @@ FEATURE_NAMES: dict[int, str] = {
     0x70: "Black Level — Blue",
     0x87: "Sharpness",
     0x8A: "Colour Saturation",
+    0x8D: "Audio Mute",
     0xAA: "Screen Orientation (OSD)",
     0xCC: "OSD Language",
     0xD6: "Power Mode",
@@ -88,9 +89,10 @@ _VCPCC = {  # 0xCC OSD language
     0x0C: "Turkish", 0x0D: "Chinese (Simplified)", 0x0E: "Portuguese (Brazil)",
 }
 
+_VCP8D = {0x01: "Muted", 0x02: "Unmuted"}  # 0x8D Audio Mute (standard MCCS)
 ENUM_LABELS: dict[int, dict[int, str]] = {
     0x14: _VCP14, 0x60: _VCP60, 0xDC: _VCPDC, 0xE2: _VCPE2,
-    0xF0: _VCPF0, 0xAA: _VCPAA, 0xD6: _VCPD6, 0xCC: _VCPCC,
+    0xF0: _VCPF0, 0xAA: _VCPAA, 0xD6: _VCPD6, 0xCC: _VCPCC, 0x8D: _VCP8D,
 }
 
 # Disruptive writes that get a confirmation prompt before applying.
@@ -101,7 +103,7 @@ DISPLAY_ORDER: list[int] = [
     0x10, 0x12, 0x87,             # image basics
     0xE2, 0xDC, 0x14, 0xF0, 0xF4, # presets / modes
     0x16, 0x18, 0x1A,             # RGB gain
-    0x8A, 0x62,                   # saturation / volume
+    0x8A, 0x62, 0x8D,             # saturation / volume / mute
     0x6C, 0x6E, 0x70,             # black levels
     0x60, 0xCC, 0xAA, 0xD6,       # input / osd / power
 ]
@@ -219,18 +221,18 @@ def feature_name(code: int) -> str:
 # leftmost. "MST" is rightmost. Control codes map to Settings / Color·Picture via
 # feature_category; the MST tab (MST enable + USB-C Prioritization) is handled
 # explicitly in the panel.
-TAB_ORDER: list[str] = ["Information", "Settings", "Color / Picture", "PIP / PBP", "MST"]
+TAB_ORDER: list[str] = ["Information", "Settings", "Color / Picture", "PIP / PBP", "MST", "KVM"]
 
-# "Settings" tab: input / OSD language / power.
-_SETTINGS_CODES: set[int] = {0x60, 0xCC, 0xD6}
+# "Settings" tab: input / OSD language / power / monitor audio (volume + mute).
+_SETTINGS_CODES: set[int] = {0x60, 0xCC, 0xD6, 0x62, 0x8D}
 
 
 def feature_category(code: int) -> str:
     """Which control sub-tab a feature belongs in (one of TAB_ORDER, never
-    'Information'/'PIP / PBP'/'MST'). Everything not in Settings is image-related →
+    'Information'/'PIP / PBP'/'MST'/'KVM'). Everything not in Settings is image-related →
     Color / Picture (brightness, contrast, sharpness, colour preset, RGB gain).
-    The PIP/PBP and MST codes are routed to their own tabs explicitly in the panel,
-    so they never reach here."""
+    The PIP/PBP, MST and KVM codes are routed to their own tabs explicitly in the
+    panel, so they never reach here."""
     if code in _SETTINGS_CODES:
         return "Settings"
     return "Color / Picture"
@@ -336,6 +338,131 @@ def has_ddc_mst_control(caps: dict[int, list[int] | None]) -> bool:
     monitors advertise 0xEF but MST enable is OSD-only (verified on the P2725HE)."""
     vals = caps.get(0xEF)
     return bool(vals) and any(v >= 0x8000 for v in vals)
+
+
+# --- USB KVM (share one keyboard/mouse between PCs, over DDC) ----------------
+# RE'd from DDPM (DDPM.UI.Module.Kvm.KvmViewModel + DisplayVCPMethod). A monitor
+# with a built-in USB KVM shares its USB hub (keyboard/mouse) between the PCs on
+# its different video inputs. Two DDC controls:
+#
+#   * Input switch = standard Input Source 0x60. The USB hub follows the active
+#     video input, so writing 0x60 IS the KVM switch (already our input control;
+#     the KVM tab re-presents it with an explicit "switch" action + warning).
+#   * USB-upstream association = 0xE7, a Dell TWO-LEVEL 16-bit word 0xFF0N:
+#         0xFF00 = Auto  — USB follows whichever input is active ("current USB"),
+#         0xFF01..0xFF04 = pin the shared USB to computer/window 1..4.
+#     Valid range 0xFF00..0xFF04 (KvmViewModel WindowList_Selected setter +
+#     OnVCPChangedEvent decode). Written as a word (set_vcp_word), and it reads
+#     back as 0xFF0N — so, unlike 0xEA USB-C Prioritization, it is *verifiable*.
+#     Auto (0xFF00) is only offered when the 0xE7 capability advertises value 0xFE
+#     (DisplayVCPMethod.isSupportedCurrentUSB → "E7 have FE").
+#
+# We gate the KVM tab on the monitor advertising 0xE7 (mirrors the MST tab gating
+# on 0xEF). The number of USB-upstream slots isn't in the caps string in a
+# decoded form (DDPM derives it from the active PIP/PBP layout), so we offer one
+# slot per selectable input (a PC per input), clamped to 2..4; writes are
+# verified, so an unsupported slot simply reports "did not take".
+USB_KVM_CODE = 0xE7
+USB_KVM_AUTO = 0xFF00           # 0xE7 word: USB follows the active input
+_USB_KVM_AUTO_FLAG = 0xFE       # advertised 0xE7 cap value that enables Auto mode
+USB_KVM_MAX_SLOTS = 4
+
+
+def has_usb_kvm(caps: dict[int, list[int] | None]) -> bool:
+    """Whether the monitor exposes the USB-KVM upstream register (0xE7). Drives
+    the KVM tab's presence, like has_mst drives the MST tab."""
+    return USB_KVM_CODE in caps
+
+
+def usb_kvm_auto_supported(caps: dict[int, list[int] | None]) -> bool:
+    """Whether 'Auto' (0xFF00, USB follows the active input) is offered — true
+    when the 0xE7 capability advertises value 0xFE (isSupportedCurrentUSB)."""
+    return _USB_KVM_AUTO_FLAG in (caps.get(USB_KVM_CODE) or [])
+
+
+def usb_kvm_upstream_controllable(caps: dict[int, list[int] | None]) -> bool:
+    """Whether the '0xFF0N current-USB' regime applies — a monitor signals it by
+    advertising 0xFE on 0xE7 (DisplayVCPMethod.isSupportedCurrentUSB). That regime
+    uses a single word (Auto / pin-to-computer). Monitors WITHOUT 0xFE use the
+    bit-packed per-input regime instead (see usb_kvm_bitpacked). The two are
+    mutually exclusive."""
+    return usb_kvm_auto_supported(caps)
+
+
+def usb_kvm_slot_count(caps: dict[int, list[int] | None]) -> int:
+    """How many manual USB-upstream slots to offer — one per selectable input
+    (a PC per input), clamped to 2..USB_KVM_MAX_SLOTS."""
+    n = len(caps.get(0x60) or [])
+    return max(2, min(USB_KVM_MAX_SLOTS, n or 2))
+
+
+def usb_kvm_options(caps: dict[int, list[int] | None]) -> list[tuple[int, str]]:
+    """(word, label) options for the USB-upstream dropdown: Auto (if supported)
+    first, then Computer 1..N. Each word is written to 0xE7 as-is."""
+    opts: list[tuple[int, str]] = []
+    if usb_kvm_auto_supported(caps):
+        opts.append((USB_KVM_AUTO, "Auto — USB follows the active input"))
+    for n in range(1, usb_kvm_slot_count(caps) + 1):
+        opts.append((USB_KVM_AUTO + n, f"Computer {n}"))
+    return opts
+
+
+# --- bit-packed per-input USB-upstream regime (0xE7 without 0xFE) ------------
+# HARDWARE-CONFIRMED on the P3424WE by OSD-correlation (three predict-then-confirm
+# steps): 0xE7 is a 16-bit word where each video input owns a 2-bit field at
+# bit (14 - 2*index), index = the input's position in the advertised 0x60 list.
+# The 2-bit value is the USB-upstream index (0 = USB-C, 1 = USB-B, ...), i.e. which
+# upstream port feeds that input's KVM. Inputs that carry USB natively (USB-C /
+# Thunderbolt) self-pair, so they get no selector. The advertised 0xE7 cap values
+# ARE the valid upstream indices (e.g. "00 01" = two upstreams). Read: (w>>pos)&3;
+# write: replace the 2-bit field and setvcp E7 <full word> (read-modify-write).
+USB_KVM_FIELD_TOP_BIT = 14
+_USB_NATIVE_INPUTS: set[int] = {0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E}  # TB1/2, USB-C 1-4
+
+
+def usb_kvm_bitpacked(caps: dict[int, list[int] | None]) -> bool:
+    """The bit-packed per-input USB-upstream regime: 0xE7 advertised, NOT the 0xFE
+    current-USB regime, and the advertised values look like small upstream indices
+    (0..3). HARDWARE-CONFIRMED on the P3424WE."""
+    if not has_usb_kvm(caps) or usb_kvm_auto_supported(caps):
+        return False
+    vals = caps.get(USB_KVM_CODE) or []
+    return bool(vals) and all(0 <= v <= 3 for v in vals)
+
+
+def usb_kvm_upstream_indices(caps: dict[int, list[int] | None]) -> list[int]:
+    """Valid USB-upstream indices advertised on 0xE7 (e.g. [0, 1] = USB-C, USB-B)."""
+    return sorted(v for v in (caps.get(USB_KVM_CODE) or []) if 0 <= v <= 3)
+
+
+def usb_kvm_pairings(caps: dict[int, list[int] | None]) -> list[tuple[int, int]]:
+    """(input_code, field_bit_position) for each input that needs a USB-upstream
+    selector — i.e. non-USB-C/Thunderbolt inputs (those self-pair). Field position
+    is 14 - 2*index over the advertised 0x60 order."""
+    out: list[tuple[int, int]] = []
+    for i, code in enumerate(caps.get(0x60) or []):
+        pos = USB_KVM_FIELD_TOP_BIT - 2 * i
+        if pos < 0:
+            break
+        if code not in _USB_NATIVE_INPUTS:
+            out.append((code, pos))
+    return out
+
+
+def usb_upstream_label(index: int) -> str:
+    """Friendly name for a USB-upstream index. 0/1 are the standard Dell two-upstream
+    layout (USB-C / USB-B); higher indices fall back to a generic label."""
+    return {0: "USB-C", 1: "USB-B"}.get(index, f"Upstream {index + 1}")
+
+
+def usb_kvm_field_value(word: int, pos: int) -> int:
+    """Extract the 2-bit USB-upstream field at bit position ``pos``."""
+    return (word >> pos) & 0b11
+
+
+def usb_kvm_set_field(word: int, pos: int, value: int) -> int:
+    """Read-modify-write: set the 2-bit field at ``pos`` to ``value`` (0..3)."""
+    return (word & ~(0b11 << pos)) | ((value & 0b11) << pos)
 
 
 def feature_kind(code: int, advertised_values: list[int] | None) -> str | None:

@@ -155,6 +155,15 @@ def detect_monitors() -> list[Monitor]:
     return monitors
 
 
+def run_detect() -> str:
+    """Raw full (non-terse) ``ddcutil detect`` output. Captured once and reused for
+    every monitor's Information tab, so we don't re-run this slow call per monitor."""
+    try:
+        return _run(["detect"])
+    except DDCError:
+        return ""
+
+
 # --- capabilities -----------------------------------------------------------
 def get_capabilities(bus: int) -> dict[int, list[int] | None]:
     """Parse the monitor's raw VESA capability string.
@@ -200,25 +209,17 @@ def _extract_paren_group(text: str, key: str) -> str | None:
 
 
 # --- read / write a single feature -----------------------------------------
-def get_vcp(bus: int, code: int) -> VcpReading:
-    out = _run(["--bus", str(bus), "getvcp", f"{code:02X}", "--terse"]).strip()
-    # Formats:
-    #   VCP 10 C 75 100                 (continuous: current, max)
-    #   VCP 14 SNC x05                  (simple non-continuous: single value)
-    #   VCP E2 CNC x00 xff x00 x00      (complex: mh ml sh sl -> we use sl)
-    parts = out.split()
-    if len(parts) < 3 or parts[0] != "VCP":
-        raise DDCError(f"unexpected getvcp output: {out!r}")
-
+def _parse_vcp_reading(parts: list[str], code: int) -> VcpReading:
+    """Parse one whitespace-split 'VCP NN ...' terse line into a VcpReading.
+    Formats:
+      VCP 10 C 75 100                 (continuous: current, max)
+      VCP 14 SNC x05                  (simple non-continuous: single value)
+      VCP E2 CNC x00 xff x00 x00      (complex: mh ml sh sl -> we use sl)
+    """
     kind_tok = parts[2]
     if kind_tok == "C":
-        return VcpReading(
-            code=code,
-            kind="continuous",
-            value=int(parts[3]),
-            maximum=int(parts[4]),
-        )
-
+        return VcpReading(code=code, kind="continuous",
+                          value=int(parts[3]), maximum=int(parts[4]))
     hexvals = [int(p.lstrip("xX"), 16) for p in parts[3:] if p.lower().startswith("x")]
     if kind_tok in ("SNC", "NC"):
         return VcpReading(code=code, kind="simple", value=hexvals[0] if hexvals else 0,
@@ -226,6 +227,44 @@ def get_vcp(bus: int, code: int) -> VcpReading:
     # CNC / anything else: the low byte (sl, last) carries the selection.
     return VcpReading(code=code, kind="complex", value=hexvals[-1] if hexvals else 0,
                       raw_bytes=hexvals)
+
+
+def get_vcp(bus: int, code: int) -> VcpReading:
+    out = _run(["--bus", str(bus), "getvcp", f"{code:02X}", "--terse"]).strip()
+    parts = out.split()
+    if len(parts) < 3 or parts[0] != "VCP":
+        raise DDCError(f"unexpected getvcp output: {out!r}")
+    return _parse_vcp_reading(parts, code)
+
+
+def get_vcp_many(bus: int, codes, timeout: int = 40) -> dict[int, VcpReading]:
+    """Read several VCP codes in ONE ddcutil invocation (amortises ddcutil's
+    per-call init — measured ~4-5x faster than one getvcp per code on a direct
+    monitor, and far fewer bus transactions, so gentler on flaky DDC controllers).
+
+    Codes that error or don't return a parseable line are simply omitted from the
+    result, so callers can just do ``values.get(code)`` exactly as before. A whole-
+    batch failure/timeout returns ``{}`` (the monitor is then treated as unreadable
+    and skipped, same as a per-code failure would have been)."""
+    codes = list(codes)
+    if not codes:
+        return {}
+    args = ["--bus", str(bus), "getvcp", *[f"{c:02X}" for c in codes], "--terse"]
+    try:
+        out = _run(args, timeout=timeout)
+    except DDCError:
+        return {}
+    result: dict[int, VcpReading] = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 3 or parts[0] != "VCP" or parts[2] == "ERR":
+            continue
+        try:
+            code = int(parts[1], 16)
+            result[code] = _parse_vcp_reading(parts, code)
+        except (ValueError, IndexError):
+            continue
+    return result
 
 
 def set_vcp(bus: int, code: int, value: int) -> None:
@@ -252,6 +291,13 @@ def _full_word(reading: "VcpReading") -> int:
     if rb and len(rb) >= 2:
         return (rb[-2] << 8) | rb[-1]  # sh:sl
     return reading.value
+
+
+def get_vcp_word(bus: int, code: int) -> int:
+    """Read a VCP code and return its full 16-bit SH:SL value (not just the low
+    byte). Used for two-level word codes that read back meaningfully, e.g. the
+    USB-KVM upstream association 0xE7 (reads back 0xFF0N)."""
+    return _full_word(get_vcp(bus, code))
 
 
 def set_vcp_bit(bus: int, code: int, bit: int, on: bool) -> int:
@@ -303,49 +349,46 @@ _TECH_TYPE = {  # VCP 0xB6 Display technology type (sl byte)
 }
 
 
-def get_monitor_info(mon: "Monitor") -> list[tuple[str, str]]:
+def get_monitor_info(mon: "Monitor", detect_text: str = "") -> list[tuple[str, str]]:
     """Return ordered (label, value) rows describing a monitor: EDID identity
     plus read-only DDC status. All reads, never writes. Missing fields are
-    silently skipped so the Information tab only shows what the panel reports."""
+    silently skipped so the Information tab only shows what the panel reports.
+
+    Pass ``detect_text`` (from ``run_detect()``) to reuse one shared ``ddcutil
+    detect`` for every monitor instead of re-running it per monitor."""
     info: list[tuple[str, str]] = []
 
     # --- EDID identity, parsed from a full (non-terse) detect block ----------
     edid: dict[str, str] = {}
-    try:
-        out = _run(["detect"])
-        for block in re.split(r"\n\s*\n", out):
-            if f"/dev/i2c-{mon.bus}" not in block:
-                continue
-            for key, pat in (
-                ("mfg", r"Mfg id:\s*(.+)"),
-                ("model", r"Model:\s*(.+)"),
-                ("product", r"Product code:\s*(.+)"),
-                ("serial", r"Serial number:\s*(.+)"),
-                ("mfg_date", r"Manufacture year:\s*(.+)"),
-                ("mccs", r"VCP version:\s*(.+)"),
-            ):
-                m = re.search(pat, block)
-                if m:
-                    edid[key] = m.group(1).strip()
-            break
-    except DDCError:
-        pass
+    out = detect_text or run_detect()
+    for block in re.split(r"\n\s*\n", out):
+        if f"/dev/i2c-{mon.bus}" not in block:
+            continue
+        for key, pat in (
+            ("mfg", r"Mfg id:\s*(.+)"),
+            ("model", r"Model:\s*(.+)"),
+            ("product", r"Product code:\s*(.+)"),
+            ("serial", r"Serial number:\s*(.+)"),
+            ("mfg_date", r"Manufacture year:\s*(.+)"),
+            ("mccs", r"VCP version:\s*(.+)"),
+        ):
+            m = re.search(pat, block)
+            if m:
+                edid[key] = m.group(1).strip()
+        break
 
     brand = _MFG_NAMES.get(mon.mfg.strip().upper())
     if not brand and edid.get("mfg") and " - " in edid["mfg"]:
         brand = edid["mfg"].split(" - ", 1)[1].strip()
     info.append(("Brand", brand or mon.mfg or "Unknown"))
 
-    # Model code lives in the capability string (e.g. "P2425D").
-    model_code = ""
-    try:
-        cap = _run(["--bus", str(mon.bus), "capabilities", "--terse"])
-        cm = re.search(r"model\(([^)]*)\)", cap)
-        if cm:
-            model_code = cm.group(1).strip()
-    except DDCError:
-        pass
-    info.append(("Model", model_code or mon.model or edid.get("model", "—")))
+    # Model name: strip the "DELL " prefix from the EDID model (avoids a second
+    # slow `capabilities` call just to read model(...) — same result).
+    model_code = (mon.model or edid.get("model", "")).strip()
+    for token in ("DELL ", "Dell ", "dell "):
+        if model_code.startswith(token):
+            model_code = model_code[len(token):].strip()
+    info.append(("Model", model_code or "—"))
     if edid.get("product"):
         info.append(("Product code", edid["product"]))
     if mon.serial or edid.get("serial"):
@@ -358,11 +401,25 @@ def get_monitor_info(mon: "Monitor") -> list[tuple[str, str]]:
         info.append(("DDC/CI (MCCS) version", edid["mccs"]))
 
     # --- read-only DDC status codes ------------------------------------------
+    # One non-terse getvcp for all four (keeps ddcutil's decoded controller/
+    # firmware strings), then split the output into per-code chunks so the same
+    # parsing as before applies to each.
+    chunks: dict[str, str] = {}
+    try:
+        combined = _run(["--bus", str(mon.bus), "getvcp", "B6", "C8", "C9", "C0"])
+        cur = None
+        for line in combined.splitlines():
+            mc = re.match(r"\s*VCP code 0x([0-9a-fA-F]{2})", line)
+            if mc:
+                cur = mc.group(1).upper()
+                chunks[cur] = line
+            elif cur is not None:
+                chunks[cur] += "\n" + line
+    except DDCError:
+        pass
+
     def _read(code: str) -> str:
-        try:
-            return _run(["--bus", str(mon.bus), "getvcp", code]).strip()
-        except DDCError:
-            return ""
+        return chunks.get(code.upper(), "").strip()
 
     b6 = _read("B6")  # panel technology
     mt = re.search(r"sl=0x([0-9a-fA-F]{2})", b6) or re.search(r"x([0-9a-fA-F]{2})\b", b6)

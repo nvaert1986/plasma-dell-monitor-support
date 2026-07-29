@@ -50,7 +50,10 @@ from .ddcutil_backend import (
     get_capabilities,
     get_monitor_info,
     get_vcp,
+    get_vcp_many,
+    get_vcp_word,
     is_read_only,
+    run_detect,
     set_vcp,
     set_vcp_bit,
     set_vcp_word,
@@ -529,6 +532,197 @@ class MstControl(_BaseControl):
         return "Enabled" if value else "Disabled"
 
 
+class KvmSwitchControl(_BaseControl):
+    """USB-KVM input switch — writes standard Input Source 0x60, but framed as a
+    KVM action (the monitor's USB hub follows the active input). Unlike the plain
+    Settings input dropdown, it does NOT switch on selection: you pick the target
+    computer's input, then press an explicit "Switch" button (switching is
+    disruptive — this machine loses the picture if you switch away from it). Reads
+    back through 0x60, so it verifies like the normal input control."""
+
+    def __init__(self, values: list[int], current: int,
+                 labels: "dict[int, str] | None" = None):
+        super().__init__(0x60)
+        self.last_good = current
+        self._labels = dict(labels or {})
+
+        self.combo = QComboBox()
+        for v in values:
+            self.combo.addItem(self._text(v), v)
+        self._set_silent(current)
+
+        self.switch_btn = QPushButton("Switch")
+        self.switch_btn.setToolTip(
+            "Switch this monitor's active video input. The keyboard/mouse follow "
+            "only if that input's computer is on a different USB upstream.")
+        self.switch_btn.clicked.connect(self._on_switch)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self.combo, 1)
+        lay.addWidget(self.switch_btn)
+        lay.addWidget(self.status)
+
+    def _text(self, value: int) -> str:
+        custom = self._labels.get(value)
+        return custom if custom else features.enum_label(0x60, value)
+
+    def _index_of(self, value: int) -> int:
+        for i in range(self.combo.count()):
+            if self.combo.itemData(i) == value:
+                return i
+        return -1
+
+    def _set_silent(self, value: int):
+        idx = self._index_of(value)
+        if idx < 0:
+            self.combo.addItem(f"{self._text(value)} (current)", value)
+            idx = self.combo.count() - 1
+        blocked = self.combo.blockSignals(True)
+        self.combo.setCurrentIndex(idx)
+        self.combo.blockSignals(blocked)
+
+    def set_labels(self, labels: "dict[int, str] | None"):
+        self._labels = dict(labels or {})
+        for i in range(self.combo.count()):
+            self.combo.setItemText(i, self._text(self.combo.itemData(i)))
+
+    def _on_switch(self):
+        self.apply_requested.emit(self.code, self.combo.currentData())
+
+    def display_value(self) -> str:
+        return self.combo.currentText()
+
+    def _fmt(self, value: int) -> str:
+        return self._text(value)
+
+
+class UsbUpstreamControl(_BaseControl):
+    """USB-KVM upstream association — the Dell two-level 0xE7 word (0xFF00 Auto,
+    0xFF01..0xFF04 = pin USB to computer 1..4). Readable (reads back as 0xFF0N),
+    so it shows the current state and verifies; apply writes the word via
+    MainWindow.apply_usb_upstream behind a confirmation."""
+
+    def __init__(self, options: list, current_word: int):
+        super().__init__(features.USB_KVM_CODE)
+        self._options = options  # list of (word, label)
+        self.last_good = current_word
+        self.combo = QComboBox()
+        for word, label in options:
+            self.combo.addItem(label, word)
+        self._set_silent(current_word)
+        self.combo.activated.connect(self._on_activated)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self.combo, 1)
+        lay.addWidget(self.status)
+
+    def _index_of(self, word: int) -> int:
+        for i in range(self.combo.count()):
+            if self.combo.itemData(i) == word:
+                return i
+        return -1
+
+    def _set_silent(self, word: int):
+        idx = self._index_of(word)
+        if idx < 0:  # monitor reports a slot it didn't advertise — show it anyway
+            self.combo.addItem(f"{self._fmt(word)} (current)", word)
+            idx = self.combo.count() - 1
+        blocked = self.combo.blockSignals(True)
+        self.combo.setCurrentIndex(idx)
+        self.combo.blockSignals(blocked)
+
+    def _on_activated(self, index: int):
+        self.apply_requested.emit(self.code, self.combo.itemData(index))
+
+    def load(self, reading: VcpReading):
+        # 0xE7 is a two-level word: reconstruct the full 0xFF0N from raw bytes
+        # (the base .load would use only the low byte in reading.value).
+        rb = reading.raw_bytes or []
+        word = ((rb[-2] << 8) | rb[-1]) if len(rb) >= 2 else reading.value
+        self.last_good = word
+        self._set_silent(word)
+        self.status.set_state("idle")
+
+    def display_value(self) -> str:
+        return self.combo.currentText()
+
+    def _fmt(self, word: int) -> str:
+        return next((label for w, label in self._options if w == word),
+                    f"0x{word:04X}")
+
+
+class UsbUpstreamPairingControl(QWidget):
+    """Per-input USB-upstream pairing for the bit-packed 0xE7 regime (P3424WE class).
+
+    Renders one dropdown per non-USB-C input ("<input>: [USB-C / USB-B / …]"). The
+    whole pairing lives in a single 16-bit 0xE7 word (each input = a 2-bit field);
+    changing one dropdown does a read-modify-write of that field and writes the full
+    word, verified by read-back (via MainWindow.apply_usb_pairing). Not a
+    _BaseControl — it drives several fields, so it talks to the window directly and
+    carries its own StatusDot. HARDWARE-CONFIRMED encoding (see features)."""
+
+    def __init__(self, panel, window, pairings, upstream_indices, current_word):
+        super().__init__()
+        self.panel = panel
+        self.window_ref = window
+        self.current_word = current_word
+        self.code = features.USB_KVM_CODE
+        self._rows: list[tuple[int, int, QComboBox]] = []  # (input_code, pos, combo)
+        self.status = StatusDot()
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(4)
+        for code, pos in pairings:
+            combo = QComboBox()
+            for idx in upstream_indices:
+                combo.addItem(features.usb_upstream_label(idx), idx)
+            self._select(combo, features.usb_kvm_field_value(current_word, pos))
+            combo.activated.connect(
+                lambda _i, c=code, p=pos, cb=combo:
+                    window.apply_usb_pairing(panel, self, c, p, cb.currentData())
+            )
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.addWidget(QLabel(features.enum_label(0x60, code)))
+            row.addWidget(combo, 1)
+            wrap = QWidget()
+            wrap.setLayout(row)
+            outer.addWidget(wrap)
+            self._rows.append((code, pos, combo))
+        srow = QHBoxLayout()
+        srow.setContentsMargins(0, 0, 0, 0)
+        srow.addStretch(1)
+        srow.addWidget(self.status)
+        sw = QWidget()
+        sw.setLayout(srow)
+        outer.addWidget(sw)
+
+    @staticmethod
+    def _select(combo: QComboBox, idx: int):
+        for i in range(combo.count()):
+            if combo.itemData(i) == idx:
+                blocked = combo.blockSignals(True)
+                combo.setCurrentIndex(i)
+                combo.blockSignals(blocked)
+                return
+
+    def set_word(self, word: int):
+        """Refresh every dropdown from a (verified) full 0xE7 word."""
+        self.current_word = word
+        for _code, pos, combo in self._rows:
+            self._select(combo, features.usb_kvm_field_value(word, pos))
+
+    def load(self, reading: VcpReading):
+        # reconstruct the full 16-bit word from raw bytes (snapshot keeps low byte only)
+        rb = reading.raw_bytes or []
+        word = ((rb[-2] << 8) | rb[-1]) if len(rb) >= 2 else reading.value
+        self.set_word(word)
+        self.status.set_state("idle")
+
+
 # --- rename-inputs dialog ---------------------------------------------------
 # --- bulk "copy settings to other monitors" ---------------------------------
 # Image settings that mean the same thing on every monitor, so they can be copied
@@ -906,6 +1100,8 @@ class MonitorPanel(QWidget):
         self.window_ref = window
         self.info = info or []
         self.controls: dict[int, _BaseControl] = {}
+        self.kvm_switch: "KvmSwitchControl | None" = None  # KVM-tab input switch (0x60)
+        self.usb_pairing: "UsbUpstreamPairingControl | None" = None  # KVM-tab 0xE7 pairing
         self.calibration = calibration.load(monitor.serial, monitor.model)
         self.input_names = input_names.load(monitor.serial, monitor.model)
 
@@ -1166,10 +1362,106 @@ class MonitorPanel(QWidget):
                 features.feature_name(features.USBC_PRIORITY_CODE) + ":", usbc
             )
 
-        # Placeholder for any control tab that ended up empty (Information, PIP/PBP
-        # and MST are all populated explicitly above, so skip them here).
+        # KVM tab (rightmost): USB-KVM controls, gated on 0xE7 (like MST on 0xEF).
+        # A USB-KVM monitor shares one keyboard/mouse (its USB hub) between the PCs
+        # on its inputs. Two DDC controls (RE'd from DDPM): the input switch (0x60,
+        # the hub follows the active input) and the USB-upstream association (0xE7).
+        kvm_form = self.forms["KVM"]
+        if features.has_usb_kvm(caps):
+            intro = QLabel(
+                "<i>This monitor has a built-in USB KVM: it shares one "
+                "keyboard/mouse (its USB hub) between the computers connected to "
+                "its video inputs.</i>"
+            )
+            intro.setWordWrap(True)
+            kvm_form.addRow(intro)
+
+            # Input switch (0x60) — a distinct KVM-framed control (NOT stored in
+            # self.controls[0x60], which is the Settings input dropdown). Pick a
+            # target input, press Switch. Its apply path (apply_kvm_switch) also
+            # syncs the Settings input control on success.
+            input_vals = caps.get(0x60)
+            if input_vals:
+                in_reading = values.get(0x60)
+                in_current = in_reading.value if in_reading else input_vals[0]
+                self.kvm_switch = KvmSwitchControl(input_vals, in_current, self.input_names)
+                self.kvm_switch.apply_requested.connect(
+                    lambda code, value, c=self.kvm_switch:
+                        window.apply_kvm_switch(self, c, value)
+                )
+                kvm_form.addRow("Switch active input:", self.kvm_switch)
+                warn = QLabel(
+                    "<i>Switches the monitor's active video input. The keyboard/mouse "
+                    "follow <b>only</b> if that input's computer is on a different USB "
+                    "upstream (see below). If the input isn't this computer, this "
+                    "screen switches away — a normal KVM switch-back.</i>"
+                )
+                warn.setWordWrap(True)
+                kvm_form.addRow(warn)
+
+            # USB-upstream association (0xE7). Only offered for the "0xFF0N
+            # current-USB" spec (monitor advertises 0xFE) — the encoding we actually
+            # decoded. Other 0xE7 monitors (e.g. the P3424WE: 0xE7 reads 0x1400, no
+            # 0xFE) use a different, agent-mediated per-input encoding we can't drive
+            # safely, so we show a note instead of a control that would write wrong
+            # values. See features.usb_kvm_upstream_controllable.
+            if features.usb_kvm_upstream_controllable(caps):
+                kvm_opts = features.usb_kvm_options(caps)
+                # values holds a VcpReading; reconstruct the full 0xFF0N word
+                # (the snapshot only keeps the low byte in .value).
+                e7_reading = values.get(features.USB_KVM_CODE)
+                current_word = features.USB_KVM_AUTO
+                if e7_reading is not None:
+                    rb = e7_reading.raw_bytes or []
+                    current_word = ((rb[-2] << 8) | rb[-1]) if len(rb) >= 2 else e7_reading.value
+                usb = UsbUpstreamControl(kvm_opts, current_word)
+                usb.apply_requested.connect(
+                    lambda code, word, c=usb: window.apply_usb_upstream(self, c, word)
+                )
+                self.controls[features.USB_KVM_CODE] = usb
+                kvm_form.addRow("USB upstream:", usb)
+                note = QLabel(
+                    "<i>The USB-upstream control is reverse-engineered from Dell's "
+                    "software and not yet verified on hardware.</i>"
+                )
+            elif features.usb_kvm_bitpacked(caps):
+                # Per-input USB-upstream pairing (bit-packed 0xE7). Encoding
+                # hardware-confirmed on the P3424WE by OSD-correlation.
+                pairings = features.usb_kvm_pairings(caps)
+                indices = features.usb_kvm_upstream_indices(caps)
+                if pairings and len(indices) >= 2:
+                    e7_reading = values.get(features.USB_KVM_CODE)
+                    current_word = 0
+                    if e7_reading is not None:
+                        rb = e7_reading.raw_bytes or []
+                        current_word = ((rb[-2] << 8) | rb[-1]) if len(rb) >= 2 else e7_reading.value
+                    self.usb_pairing = UsbUpstreamPairingControl(
+                        self, window, pairings, indices, current_word)
+                    # header on its own line, per-input rows below it (not inline)
+                    kvm_form.addRow(QLabel("<b>USB upstream (per input):</b>"))
+                    kvm_form.addRow(self.usb_pairing)
+                note = QLabel(
+                    "<i>Choose which USB upstream port (e.g. USB-C or USB-B) feeds "
+                    "each video input. Inputs that carry USB themselves (USB-C / "
+                    "Thunderbolt) aren't listed. Verified on the P3424WE.</i>"
+                )
+            else:
+                note = QLabel(
+                    "<i>The USB hub follows the active input (switch above). "
+                    "Per-computer USB pairing, if this monitor has it, is set from "
+                    "the monitor's on-screen (OSD) menu.</i>"
+                )
+            note.setWordWrap(True)
+            kvm_form.addRow(note)
+        else:
+            note = QLabel("<i>USB KVM is not available on this monitor.</i>")
+            note.setWordWrap(True)
+            kvm_form.addRow(note)
+
+        # Placeholder for any control tab that ended up empty (Information, PIP/PBP,
+        # MST and KVM are all populated explicitly above, so skip them here).
         for category, cat_form in self.forms.items():
-            if category not in ("Information", "PIP / PBP", "MST") and cat_form.rowCount() == 0:
+            if category not in ("Information", "PIP / PBP", "MST", "KVM") and cat_form.rowCount() == 0:
                 cat_form.addRow(QLabel("<i>No adjustable features on this tab.</i>"))
 
         outer.addWidget(self.subtabs, 1)
@@ -1223,6 +1515,10 @@ class MonitorPanel(QWidget):
     def set_enabled_controls(self, enabled: bool):
         for ctl in self.controls.values():
             ctl.setEnabled(enabled)
+        if self.kvm_switch is not None:  # not in self.controls (own 0x60 presentation)
+            self.kvm_switch.setEnabled(enabled)
+        if self.usb_pairing is not None:  # not in self.controls (own 0xE7 presentation)
+            self.usb_pairing.setEnabled(enabled)
         if enabled:
             has_continuous = any(
                 isinstance(c, ContinuousControl) for c in self.controls.values()
@@ -1450,43 +1746,29 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _collect_snapshot():
         snapshots = []
+        detect_text = run_detect()  # one shared full `detect` for all Info tabs
         for mon in detect_monitors():
             if not mon.is_dell:
                 # Not a Dell panel — don't probe it; it gets an "unsupported" tab.
                 snapshots.append((mon, None, {}, None))
                 continue
             caps = get_capabilities(mon.bus)
-            values: dict[int, VcpReading] = {}
-            for code in features.ordered_editable(caps):
-                if is_read_only(code):
-                    continue  # e.g. 0xAA Screen Orientation — reportable, not settable
-                try:
-                    values[code] = get_vcp(mon.bus, code)
-                except DDCError:
-                    pass  # feature advertised but unreadable — skip its control
-            # read the read-only 0xE2 register too, to seed the merged preset
+            # Read every value we need in ONE ddcutil call — far faster than one
+            # getvcp per code, and fewer bus transactions (gentler on flaky panels).
+            codes = [c for c in features.ordered_editable(caps) if not is_read_only(c)]
             if features.has_merged_preset(caps) and 0xE2 in caps:
-                try:
-                    values[features.PRESET_CODE] = get_vcp(mon.bus, 0xE2)
-                except DDCError:
-                    pass
-            # read the 0xEF bitmask register to seed the MST toggle — only on
-            # new-spec monitors, where the toggle is actually shown (old-spec 0xEF
-            # monitors get an OSD-only note, so the read would be wasted)
+                codes.append(features.PRESET_CODE)          # 0xE2, seeds merged preset
             if features.has_ddc_mst_control(caps):
-                try:
-                    values[features.MST_CODE] = get_vcp(mon.bus, features.MST_CODE)
-                except DDCError:
-                    pass
-            # read the PIP/PBP registers (mode 0xE9, sub-input 0xE8, status 0xE5)
+                codes.append(features.MST_CODE)             # 0xEF, new-spec MST toggle
             if features.has_pip(caps):
-                for pip_code in (features.PIP_MODE_CODE, features.PIP_SUBINPUT_CODE,
-                                 features.PIP_STATUS_CODE):
-                    try:
-                        values[pip_code] = get_vcp(mon.bus, pip_code)
-                    except DDCError:
-                        pass
-            info = get_monitor_info(mon)  # read-only identity/status for the Info tab
+                codes += [features.PIP_MODE_CODE, features.PIP_SUBINPUT_CODE,
+                          features.PIP_STATUS_CODE]         # 0xE9 / 0xE8 / 0xE5
+            if features.has_usb_kvm(caps):
+                codes.append(features.USB_KVM_CODE)         # 0xE7, USB-KVM upstream
+            seen: set[int] = set()
+            codes = [c for c in codes if not (c in seen or seen.add(c))]  # dedupe, keep order
+            values: dict[int, VcpReading] = get_vcp_many(mon.bus, codes)
+            info = get_monitor_info(mon, detect_text)  # reuse the shared detect
             snapshots.append((mon, caps, values, info))
         return snapshots
 
@@ -1640,6 +1922,8 @@ class MainWindow(QMainWindow):
         input_names.save(panel.monitor.serial, panel.monitor.model, names)
         panel.input_names = names
         ctl.set_labels(names)          # refresh the dropdown text
+        if panel.kvm_switch is not None:
+            panel.kvm_switch.set_labels(names)  # and the KVM-tab switch
         self._rebuild_tray_menu()      # and the tray submenu
         self.statusBar().showMessage(f"{panel.monitor.model}: input names updated.", 4000)
 
@@ -1725,6 +2009,154 @@ class MainWindow(QMainWindow):
             f"{panel.monitor.model}: MST → {'Enabled' if actual_on else 'Disabled'}",
             6000,
         )
+
+    # -- USB KVM: input switch (0x60) + USB-upstream association (0xE7) -------
+    def apply_kvm_switch(self, panel: MonitorPanel, control, value: int):
+        """Switch the monitor's active input from the KVM tab (writes 0x60). The
+        USB hub follows the input, so this hands keyboard/mouse to that computer.
+        Disruptive — this machine may lose the picture — so it's confirmed."""
+        label = features.enum_label(0x60, value)
+        reply = QMessageBox.question(
+            self,
+            "USB KVM — switch",
+            f"Switch <b>{panel.monitor.model}</b> to <b>{label}</b>?<br><br>"
+            "This changes the monitor's active video input. The keyboard/mouse "
+            "follow only if that input's computer is on a different USB upstream. "
+            "If the input isn't this computer, this screen will switch away.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            control.revert()
+            return
+        control.set_busy()
+        self.statusBar().showMessage(f"{panel.monitor.model}: switching input (KVM)…")
+        worker = Worker(self._set_and_verify, panel.monitor.bus, 0x60, value)
+        worker.signals.finished.connect(
+            lambda reading: self._on_kvm_switch_applied(panel, control, value, reading)
+        )
+        worker.signals.error.connect(
+            lambda msg: self._on_apply_error(panel, control, 0x60, msg)
+        )
+        self.pool.start(worker)
+
+    def _on_kvm_switch_applied(self, panel, control, requested, reading):
+        control.apply_readback(reading, requested)
+        # keep the Settings-tab input dropdown (same 0x60) in sync
+        settings_input = panel.controls.get(0x60)
+        if isinstance(settings_input, EnumControl):
+            settings_input._set_silent(reading.value)
+        self._rebuild_tray_menu()
+        if control.ok_result:
+            self.statusBar().showMessage(
+                f"{panel.monitor.model}: switched to {control.display_value()} ✓", 5000)
+        else:
+            self.statusBar().showMessage(
+                f"{panel.monitor.model}: input did not switch — monitor reports "
+                f"{control.display_value()}", 8000)
+
+    def apply_usb_upstream(self, panel: MonitorPanel, control, word: int):
+        """Set the USB-upstream association (0xE7 two-level word). Auto (0xFF00)
+        follows the active input; 0xFF0N pins USB to computer N. Reads back."""
+        label = control._fmt(word)
+        reply = QMessageBox.question(
+            self,
+            "USB KVM — USB upstream",
+            f"Set USB upstream to <b>{label}</b> on "
+            f"<b>{panel.monitor.model}</b>?<br><br>"
+            "This changes which computer the monitor's shared USB keyboard/mouse "
+            "is connected to. The USB devices may briefly reconnect.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            control.revert()
+            return
+        control.set_busy()
+        self.statusBar().showMessage(f"{panel.monitor.model}: setting USB upstream…")
+        worker = Worker(self._set_word_and_verify, panel.monitor.bus,
+                        features.USB_KVM_CODE, word)
+        worker.signals.finished.connect(
+            lambda newword: self._on_usb_upstream_applied(panel, control, word, newword)
+        )
+        worker.signals.error.connect(
+            lambda msg: self._on_apply_error(panel, control, features.USB_KVM_CODE, msg)
+        )
+        self.pool.start(worker)
+
+    @staticmethod
+    def _set_word_and_verify(bus: int, code: int, word: int) -> int:
+        set_vcp_word(bus, code, word)
+        time.sleep(_SETTLE_SECONDS)
+        return get_vcp_word(bus, code)  # full 16-bit read-back
+
+    def _on_usb_upstream_applied(self, panel, control, requested, newword):
+        control.last_good = newword
+        control._set_silent(newword)
+        if newword == requested:
+            control.ok_result = True
+            control.status.set_state("ok", f"confirmed = {control._fmt(newword)}")
+        else:
+            control.ok_result = False
+            control.status.set_state("warn", "USB upstream did not take")
+        self.statusBar().showMessage(
+            f"{panel.monitor.model}: USB upstream → {control._fmt(newword)}", 6000)
+
+    # -- USB KVM: per-input USB-upstream pairing (bit-packed 0xE7) ------------
+    def apply_usb_pairing(self, panel: MonitorPanel, control, input_code: int,
+                          pos: int, upstream_index: int):
+        """Bind one input's USB to a given upstream, via a read-modify-write of the
+        input's 2-bit field in the 0xE7 word (encoding hardware-confirmed on the
+        P3424WE). Verified by read-back of that field."""
+        input_label = features.enum_label(0x60, input_code)
+        up_label = features.usb_upstream_label(upstream_index)
+        reply = QMessageBox.question(
+            self,
+            "USB KVM — USB upstream",
+            f"Feed <b>{input_label}</b> from the <b>{up_label}</b> upstream on "
+            f"<b>{panel.monitor.model}</b>?<br><br>"
+            "This changes which USB port supplies the keyboard/mouse when that "
+            "input is active. USB devices may briefly reconnect.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            control.set_word(control.current_word)  # revert the dropdown
+            return
+        new_word = features.usb_kvm_set_field(control.current_word, pos, upstream_index)
+        control.status.set_state("busy", "applying…")
+        self.statusBar().showMessage(
+            f"{panel.monitor.model}: setting USB upstream for {input_label}…")
+        worker = Worker(self._set_word_and_verify, panel.monitor.bus,
+                        features.USB_KVM_CODE, new_word)
+        worker.signals.finished.connect(
+            lambda got: self._on_usb_pairing_applied(
+                panel, control, input_label, pos, upstream_index, got)
+        )
+        worker.signals.error.connect(
+            lambda msg: self._on_usb_pairing_error(panel, control, input_code, msg)
+        )
+        self.pool.start(worker)
+
+    def _on_usb_pairing_applied(self, panel, control, input_label, pos,
+                                requested_index, got_word):
+        control.set_word(got_word)
+        if features.usb_kvm_field_value(got_word, pos) == requested_index:
+            control.status.set_state(
+                "ok", f"{input_label} → {features.usb_upstream_label(requested_index)}")
+            self.statusBar().showMessage(
+                f"{panel.monitor.model}: {input_label} USB → "
+                f"{features.usb_upstream_label(requested_index)} ✓", 6000)
+        else:
+            control.status.set_state("warn", "USB upstream did not take")
+            self.statusBar().showMessage(
+                f"{panel.monitor.model}: {input_label} USB pairing did not take", 8000)
+
+    def _on_usb_pairing_error(self, panel, control, input_code, msg):
+        control.set_word(control.current_word)  # revert to last known-good
+        control.status.set_state("error", msg)
+        self.statusBar().showMessage(
+            f"{panel.monitor.model}: USB pairing failed — {msg}", 8000)
 
     # -- PIP / PBP (0xE9 mode + 0x01/0x02 command toggles) -------------------
     def apply_pip_mode(self, panel: MonitorPanel, control, value: int):
@@ -1854,6 +2286,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"{panel.monitor.model}: re-reading…")
         bus = panel.monitor.bus
         codes = list(panel.controls.keys())
+        if panel.usb_pairing is not None and features.USB_KVM_CODE not in codes:
+            codes.append(features.USB_KVM_CODE)  # not in .controls, but needs re-reading
         worker = Worker(self._read_values, bus, codes)
         worker.signals.finished.connect(lambda vals: self._on_refreshed(panel, vals))
         worker.signals.error.connect(
@@ -1864,18 +2298,19 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _read_values(bus: int, codes: list[int]) -> dict[int, VcpReading]:
-        out = {}
-        for code in codes:
-            try:
-                out[code] = get_vcp(bus, code)
-            except DDCError:
-                pass
-        return out
+        # one batched ddcutil call (see get_vcp_many) — was one getvcp per code
+        return get_vcp_many(bus, codes)
 
     def _on_refreshed(self, panel: MonitorPanel, values: dict[int, VcpReading]):
         for code, reading in values.items():
             if code in panel.controls:
                 panel.controls[code].load(reading)
+        # keep the KVM-tab input switch (not in .controls) in sync with 0x60
+        if panel.kvm_switch is not None and 0x60 in values:
+            panel.kvm_switch.load(values[0x60])
+        # and the per-input USB-upstream pairing (not in .controls) with 0xE7
+        if panel.usb_pairing is not None and features.USB_KVM_CODE in values:
+            panel.usb_pairing.load(values[features.USB_KVM_CODE])
         panel.set_enabled_controls(True)
         self._rebuild_tray_menu()
         self.statusBar().showMessage(f"{panel.monitor.model}: re-read complete.", 4000)
