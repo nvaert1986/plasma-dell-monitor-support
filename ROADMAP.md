@@ -4,21 +4,30 @@ Features planned for future releases. This is a wishlist / direction, not a
 promise — priorities may change, and some items depend on what individual Dell
 monitors actually expose over DDC/CI (firmware varies between models).
 
-*Currently shipping (1.1):* per-monitor Brightness, Contrast, Sharpness, RGB gain,
+*Currently shipping (1.3):* per-monitor Brightness, Contrast, Sharpness, RGB gain,
 Colour Preset, Input Source, OSD Language, Power Mode; per-monitor sub-tabs with an
 **Information** tab; **PIP / PBP** and **MST** (experimental) support; optional range
 calibration; custom (app-side) input labels; factory reset; retry detection;
 **copy settings to other monitors**; **export / import settings** (save a monitor's
-settings to a file and apply them to the same or another monitor); system-tray quick
-controls; and a basic USB-C Prioritization control on monitors that support it.
+settings to a file and apply them to the same or another monitor); **profiles** (10
+per-monitor slots); **command-line control** for hotkeys; system-tray quick controls;
+a basic USB-C Prioritization control on monitors that support it; **monitor audio**
+(volume / mute, experimental); and a **USB KVM** tab — input switch plus per-input
+USB-upstream pairing (verified on the P3424WE), or Auto/per-computer on monitors using
+Dell's other USB-KVM scheme *(experimental)*.
 
 ## Planned
 
-- **USB KVM control.**
-  On monitors with a built-in KVM (their USB hub follows the active input), let you
-  switch which computer has the keyboard/mouse from the app or a hotkey — by
-  switching the monitor's input over DDC. Includes reading/setting the USB-upstream
-  pairing where supported.
+- **Gaming controls** *(needs a gaming Dell to develop/test)*.
+  Response time / overdrive, dark stabilizer, on-screen crosshair / timer / FPS
+  counter, and Vision Engine — on Alienware / gaming monitors that expose them.
+
+- **Monitor shortcut-button configuration** *(needs a monitor with configurable
+  buttons + validation)*. Assign what the monitor's physical shortcut keys do.
+
+- **Extra display options / auto-brightness** *(model-dependent; needs validation)*.
+  Miscellaneous per-monitor toggles and, on monitors with an ambient-light sensor,
+  automatic brightness.
 
 - **Faster MST detection.**
   With an MST daisy-chain active, detection currently takes ~2 minutes. Batching

@@ -18,10 +18,11 @@ aren't in this list — this is just what's been confirmed by hand.
 | **P2425D** ×2 | DisplayPort | 2560×1440 | The baseline. Everything standard works. |
 | **P2425H** | DisplayPort | 1920×1080 | 24″; sharpness works. |
 | **P2222H** | DisplayPort | 1920×1080 | Entry 22″; VGA/DP/HDMI inputs. |
+| **P2422H** | DisplayPort | 1920×1080 | 24″; VGA/DP/HDMI inputs (like the P2222H). |
 | **U2412M** | DisplayPort | 1920×1200 | Older UltraSharp, 16:10; VGA/DVI/DP. |
 | **P2319H** | DisplayPort | 1920×1080 | Has the ComfortView blue-light preset. |
 | **P2317H** | HDMI | 1920×1080 | Older/simpler panel. |
-| **P3424WE** | USB-C | 3440×1440 | 34″ ultrawide; **PIP / PBP works**. |
+| **P3424WE** | USB-C | 3440×1440 | 34″ ultrawide; **PIP / PBP works**; **USB KVM** (per-input USB port) works. |
 | **P2725HE** | USB-C | 1920×1080 | USB-C hub; MST-capable. |
 
 **Works on every model above:** brightness, contrast, RGB colour gain, colour
@@ -52,6 +53,11 @@ confirmed working.
 Standard controls work (writes confirmed). Inputs are VGA, DisplayPort and HDMI.
 It has an OSD-language control but **no sharpness** over the cable.
 
+### P2422H (24″ Full HD)
+The 24″ sibling of the P2222H — same story. Standard controls work; inputs are VGA,
+DisplayPort and HDMI; it has an OSD-language control but **no sharpness** over the
+cable, and no ComfortView. Nothing special needed.
+
 ### U2412M (older 24″ UltraSharp, 16:10 / 1920×1200)
 The oldest panel tested. Brightness, contrast, colour gain, colour preset, input
 (VGA/DVI/DP) and power all work, and **factory reset works**. What *doesn't* work
@@ -77,6 +83,10 @@ window's input, and toggle its size/position. Note that switching PIP/PBP mode
 briefly blanks the screen while the panel re-initialises (normal), and a second
 picture only appears when a second input is actually plugged in. Sharpness and
 aspect ratio on this model are on-screen-menu only (not controllable over the cable).
+Its **USB KVM** also works: the KVM tab lets you choose which USB port (USB-C / USB-B)
+feeds each video input, verified on this monitor. The USB-C input always uses its own
+cable (it carries USB and video together), so only the HDMI/DisplayPort inputs are
+listed there.
 
 ### P2725HE (USB-C hub monitor)
 Standard controls work, including sharpness. It's **MST-capable** (DisplayPort

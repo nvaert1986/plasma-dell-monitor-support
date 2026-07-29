@@ -8,7 +8,7 @@ per monitor — from your desktop instead of fumbling with the monitor's buttons
 It talks to the monitor the same way Dell's own *Display & Peripheral Manager*
 does on Windows, but natively on Linux.
 
-**Version 1.2** — see the [Changelog](#changelog).
+**Version 1.3** — see the [Changelog](#changelog).
 
 ---
 
@@ -25,15 +25,20 @@ does on Windows, but natively on Linux.
 - Detects connected **Dell** monitors (DisplayPort / HDMI / USB-C DP-Alt).
 - Per-monitor controls: **Brightness, Contrast, Sharpness, RGB gain, Colour
   Preset** (Standard / Movie / Game / ComfortView / Cool / Warm / Custom, where
-  supported), **Input Source, OSD Language, Power Mode**.
+  supported), **Input Source, OSD Language, Power Mode**, and **speaker Volume /
+  Mute** on monitors with built-in audio.
 - **Set-then-verify** — every change is read back from the monitor to confirm it
   applied.
 - Per-monitor **sub-tabs**: **Information** (read-only identity/status), Settings,
-  Color / Picture, **PIP / PBP**, and **MST**.
+  Color / Picture, **PIP / PBP**, **MST**, and **KVM**.
 - **PIP / PBP** — Picture-in-Picture / Picture-by-Picture: mode, sub-window input,
   and size/position toggles, on monitors that support it.
 - **MST (Multi-Stream Transport)** — DisplayPort daisy-chaining enable/disable, on
   monitors that support it *(experimental — see limitations)*.
+- **USB KVM** — on monitors with a built-in USB KVM, switch which computer gets the
+  shared keyboard/mouse (the USB hub follows the active input), and choose which USB
+  upstream port (e.g. USB-C / USB-B) feeds each input *(experimental — see
+  limitations)*.
 - Optional per-monitor **range calibration** (some panels clamp/quantise values
   over DDC) and **custom input labels**.
 - **Factory reset** — restore a monitor to its factory defaults over DDC/CI.
@@ -191,6 +196,7 @@ These have been verified:
 | Dell **P2425D** | DisplayPort | Baseline (QHD). |
 | Dell **P2425H** | DisplayPort | Full HD; sharpness works. |
 | Dell **P2222H** | DisplayPort | Full HD entry (VGA/DP/HDMI). |
+| Dell **P2422H** | DisplayPort | 24″ Full HD (VGA/DP/HDMI); P2222H twin. |
 | Dell **U2412M** | DisplayPort | UltraSharp 16:10 (1920×1200); older panel. |
 | Dell **P2319H** | DisplayPort | Full HD; has ComfortView. |
 | Dell **P2317H** | HDMI | Full HD; older/simpler panel. |
@@ -212,6 +218,14 @@ See [`TESTED-MONITORS.md`](TESTED-MONITORS.md) for per-model detail.
   a DDC command but don't actually act on it (a firmware quirk — the setting only
   works from the monitor's own on-screen menu). Examples seen in testing include
   sharpness and aspect ratio on certain models.
+- **USB KVM is experimental.** The switch is just a standard input change (the USB
+  hub follows the active input); switching to another computer's input makes **this**
+  computer lose the picture (a normal KVM switch-back), so it's best driven from the
+  computer you're switching *to*. The keyboard/mouse only actually move when a **second**
+  computer is connected to the other USB upstream — with one computer, switching input
+  just changes the video. The per-input USB-upstream control is reverse-engineered from
+  Dell's Windows software; it's verified working on the P3424WE (writes take effect and
+  are read-back-checked) but hasn't been validated on other models yet.
 - **A feature the monitor has in its OSD is not guaranteed to be controllable over
   DDC** — if the monitor doesn't advertise it, no software (including Dell's own)
   can set it remotely.
@@ -219,6 +233,19 @@ See [`TESTED-MONITORS.md`](TESTED-MONITORS.md) for per-model detail.
   refresh rate, rotation — are intentionally **out of scope**.
 
 ## Changelog
+
+### 1.3
+- **USB KVM** *(experimental)*. On monitors with a built-in USB KVM (advertising
+  `0xE7`), a new **KVM** tab lets you switch the active input (the USB hub follows it)
+  and **choose which USB upstream port (e.g. USB-C or USB-B) feeds each video input** —
+  the `0xE7` bit-packed encoding was reverse-engineered and hardware-verified on the
+  P3424WE. Inputs that carry USB themselves (USB-C DP-Alt / Thunderbolt) always use their
+  own cable and aren't listed; the keyboard/mouse only actually move when a *second*
+  computer is on the other upstream. On monitors using Dell's other USB-KVM scheme you
+  can instead set the upstream to *Auto* / pin it to a computer.
+- **Monitor audio** *(experimental — not yet verified on hardware)*. On monitors
+  with built-in speakers, Volume and Mute controls appear on the Settings tab
+  (shown only when the monitor advertises them).
 
 ### 1.2
 - **Profiles — 10 saved slots per monitor.** Save a monitor's visual settings
@@ -241,6 +268,10 @@ See [`TESTED-MONITORS.md`](TESTED-MONITORS.md) for per-model detail.
 - **Information tab niceties.** A **Copy** button next to the serial number, and an
   **"Export information…"** button that saves everything shown on the Information tab
   to a `.txt` file (`Dell-<model>-<serial>.txt`).
+- **Faster monitor detection.** Batches each monitor's reads into a single
+  `ddcutil` call and reuses one shared `detect` pass for the Information tabs, cutting
+  many redundant `ddcutil` invocations (startup ~5.8s → ~3.9s on a 2× P2425D setup,
+  and much more on slow MST chains) — quicker, and gentler on the monitor.
 
 ### 1.1
 - **PIP / PBP support** — mode, sub-window input, and size/position toggles
@@ -253,7 +284,8 @@ See [`TESTED-MONITORS.md`](TESTED-MONITORS.md) for per-model detail.
   firmware, panel technology, connection, etc.).
 - **Retry detection** — re-scan for monitors from the app without restarting.
 - **Factory reset** button — restore a monitor to factory defaults over DDC/CI.
-- **More tested monitors** — added P2425H, P2222H, U2412M (now 8 verified models).
+- **More tested monitors** — added P2425H, P2222H, P2422H, U2412M (now 9 verified
+  models).
 
 ### 1.0
 - Initial release: per-monitor Brightness, Contrast, Sharpness, RGB gain, merged
