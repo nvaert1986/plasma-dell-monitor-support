@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools", "setuptools-scm" ]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "plasma-dell-monitor-support"
+dynamic = [ "version" ]
+dependencies = [ "PyQt6" ]
+
+[project.scripts]
+plasma-dell-monitor-support = "plasma_dell_monitor.app:main"
+plasma-dell-monitor-cli = "plasma_dell_monitor.cli:main"
+
+[tool.setuptools_scm]
+
+[tool.setuptools]
+script-files = [ "scripts/collect-monitor-info.sh" ]
+
+[tool.setuptools.data-files]
+"share/applications" = [ "data/plasma-dell-monitor-support.desktop" ]
